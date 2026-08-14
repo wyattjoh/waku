@@ -1138,8 +1138,8 @@ impl Waku {
             })
             .map(sidebar_session_timestamp)
             .max();
-        let time_ago = latest_run
-            .map(|timestamp| format_time_ago(unix_time().saturating_sub(timestamp)));
+        let time_ago =
+            latest_run.map(|timestamp| format_time_ago(unix_time().saturating_sub(timestamp)));
         // A currently-working run turns the trailing metadata into the same
         // spinner + "Working…" treatment the run rows use.
         let running_session = self.state.sessions.iter().find(|session| {
@@ -1155,8 +1155,7 @@ impl Waku {
         let owns_selection = self.automations_page.is_none()
             && self.state.selected_session.is_some_and(|selected| {
                 self.state.sessions.iter().any(|session| {
-                    session.id == selected
-                        && session.originating_automation == Some(automation_id)
+                    session.id == selected && session.originating_automation == Some(automation_id)
                 })
             });
         let highlight = owns_selection && !expanded;
@@ -1189,9 +1188,7 @@ impl Waku {
                             status_color(&theme, session.status),
                         )
                         .with_animation(
-                            SharedString::from(format!(
-                                "automation-group-spinner-{automation_id}"
-                            )),
+                            SharedString::from(format!("automation-group-spinner-{automation_id}")),
                             Animation::new(Duration::from_millis(900))
                                 .repeat()
                                 .with_easing(gpui::linear),
@@ -1232,7 +1229,9 @@ impl Waku {
         let keyboard_menu = menu.clone();
 
         let row = div()
-            .id(SharedString::from(format!("automation-group-{automation_id}")))
+            .id(SharedString::from(format!(
+                "automation-group-{automation_id}"
+            )))
             .group(group_name)
             .tab_index(0)
             .w_full()
@@ -1265,7 +1264,11 @@ impl Waku {
                             .line_clamp(1)
                             .text_overflow(gpui::TextOverflow::Truncate("...".into()))
                             .text_size(px(13.5))
-                            .text_color(if enabled { theme.text } else { theme.text_tertiary })
+                            .text_color(if enabled {
+                                theme.text
+                            } else {
+                                theme.text_tertiary
+                            })
                             .child(SharedString::from(name)),
                     )
                     .child(chevron),
@@ -1274,8 +1277,8 @@ impl Waku {
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.toggle_sidebar_automation(automation_id, cx);
             }))
-            .on_key_down(cx.listener(
-                move |this, event: &KeyDownEvent, window, cx| match event.keystroke.key.as_str() {
+            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
+                match event.keystroke.key.as_str() {
                     "enter" | "space" => {
                         this.toggle_sidebar_automation(automation_id, cx);
                         cx.stop_propagation();
@@ -1293,8 +1296,8 @@ impl Waku {
                         cx.stop_propagation();
                     }
                     _ => {}
-                },
-            ));
+                }
+            }));
 
         // Right-click (or Shift+F10) to run now, edit, or toggle enabled.
         // The bottom gap separates the group row from its runs, matching the
@@ -1385,8 +1388,8 @@ impl Waku {
             )
         };
         // Down chevron reads as "reveal more"; flip it up once expanded.
-        let chevron =
-            icon("icons/chevron-down.svg", 11.0, theme.text_ghost).when(expanded, |icon| {
+        let chevron = icon("icons/chevron-down.svg", 11.0, theme.text_ghost)
+            .when(expanded, |icon| {
                 icon.with_transformation(gpui::Transformation::rotate(gpui::percentage(0.5)))
             });
 
@@ -1428,10 +1431,7 @@ impl Waku {
     }
 
     fn toggle_sidebar_automation_runs(&mut self, automation_id: Uuid, cx: &mut Context<Self>) {
-        if !self
-            .sidebar_expanded_automation_runs
-            .remove(&automation_id)
-        {
+        if !self.sidebar_expanded_automation_runs.remove(&automation_id) {
             self.sidebar_expanded_automation_runs.insert(automation_id);
         }
         cx.notify();

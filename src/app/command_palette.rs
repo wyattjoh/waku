@@ -1009,9 +1009,7 @@ impl Waku {
             }
             PaletteAction::OpenAutomations => self.open_automations(window, cx),
             PaletteAction::NewAutomation => self.open_automation_editor(None, window, cx),
-            PaletteAction::OpenAutomation(id) => {
-                self.open_automation_editor(Some(id), window, cx)
-            }
+            PaletteAction::OpenAutomation(id) => self.open_automation_editor(Some(id), window, cx),
             PaletteAction::ChooseModel | PaletteAction::ToggleUsage => {
                 // These popovers are rendered by the composer. If the command
                 // came from Settings, reveal one normal app frame first so its
