@@ -23,6 +23,7 @@ mod amp_session;
 mod analytics;
 mod app;
 mod assets;
+mod automation;
 mod blob_store;
 mod browser;
 mod checkpoint;
