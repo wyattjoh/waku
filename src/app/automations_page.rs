@@ -156,7 +156,7 @@ impl AutomationEditor {
         };
         let (fresh_worktree, base_branch) = match &automation.workspace {
             SessionWorkspace::NewWorktree { base_branch } => (true, base_branch.clone()),
-            SessionWorkspace::Worktree { branch, .. } => (true, Some(branch.clone())),
+            SessionWorkspace::Worktree { branch, .. } => (true, branch.clone()),
             SessionWorkspace::Local => (false, None),
         };
         Self {
@@ -1045,7 +1045,7 @@ impl Waku {
             }))
     }
 
-    fn render_automation_editor(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_automation_editor(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::current(cx);
         let Some(AutomationsPage::Editor(editor)) = self.automations_page.as_ref() else {
             return div().into_any_element();
@@ -1252,7 +1252,12 @@ impl Waku {
         )
     }
 
-    fn editor_agent_section(&self, id: Option<Uuid>, theme: &Theme, cx: &mut Context<Self>) -> Div {
+    fn editor_agent_section(
+        &mut self,
+        id: Option<Uuid>,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Div {
         // A composer-style card: the prompt textarea with the model/access
         // controls docked beneath it, mirroring the new-task composer so the
         // editor's core reads like the surface a user already knows.

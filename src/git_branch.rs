@@ -1,9 +1,10 @@
 //! Git branch discovery and checkout operations for workspace selectors.
 //!
-//! Every function in this module performs process I/O. Callers must run them
-//! from the background executor; render paths consume only the cached
-//! [`BranchSnapshot`] values they return.
+//! Git inspection and mutation functions in this module perform process I/O;
+//! callers must run them from the background executor. Render paths consume
+//! only cached snapshots and pure picker models.
 
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
@@ -31,12 +32,174 @@ pub struct BranchEntry {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WorktreeHead {
+    Branch(String),
+    Detached { commit: String },
+}
+
+impl WorktreeHead {
+    pub fn branch(&self) -> Option<&str> {
+        match self {
+            Self::Branch(branch) => Some(branch),
+            Self::Detached { .. } => None,
+        }
+    }
+
+    pub fn commit(&self) -> Option<&str> {
+        match self {
+            Self::Branch(_) => None,
+            Self::Detached { commit } => Some(commit),
+        }
+    }
+
+    pub fn display_commit(&self) -> Option<String> {
+        self.commit().map(short_commit)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorktreeEntry {
+    /// The Git worktree root, canonicalized while discovery runs.
+    pub root: PathBuf,
+    pub head: WorktreeHead,
+    /// A lock is metadata only. Locked but valid worktrees remain selectable.
+    pub locked: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorktreeSnapshot {
+    pub repository: PathBuf,
+    /// The canonical project path in the active checkout. It is always
+    /// excluded from shared rows, even when the caller originally stored a
+    /// symlinked or non-canonical project path.
+    pub project_path: PathBuf,
+    /// The project path relative to the repository root. An empty path means
+    /// the project itself is the repository root.
+    pub project_relative: PathBuf,
+    pub worktrees: Vec<WorktreeEntry>,
+}
+
+impl WorktreeSnapshot {
+    pub fn project_path(&self, worktree: &WorktreeEntry) -> PathBuf {
+        worktree.root.join(&self.project_relative)
+    }
+
+    pub fn shared_worktrees(&self, excluded_paths: &[&Path]) -> Vec<SharedWorktree> {
+        self.worktrees
+            .iter()
+            .filter_map(|worktree| {
+                let path = self.project_path(worktree);
+                if path == self.project_path
+                    || excluded_paths.iter().any(|excluded| *excluded == path)
+                {
+                    return None;
+                }
+                Some(SharedWorktree {
+                    path,
+                    name: worktree_name(&worktree.root),
+                    head: worktree.head.clone(),
+                })
+            })
+            .collect()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SharedWorktree {
+    /// The project-relative path a task should use, not just the repository
+    /// root. This is what gets persisted in the session workspace.
+    pub path: PathBuf,
+    /// The linked worktree folder, used for detached picker labels.
+    pub name: String,
+    pub head: WorktreeHead,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WorkspaceRef {
+    Branch {
+        name: String,
+        checked_out_elsewhere: bool,
+    },
+    Shared(SharedWorktree),
+}
+
+impl WorkspaceRef {
+    pub fn branch_name(&self) -> Option<&str> {
+        match self {
+            Self::Branch { name, .. } => Some(name),
+            Self::Shared(worktree) => worktree.head.branch(),
+        }
+    }
+
+    pub fn display_name(&self) -> &str {
+        match self {
+            Self::Branch { name, .. } => name,
+            Self::Shared(worktree) => worktree.head.branch().unwrap_or(worktree.name.as_str()),
+        }
+    }
+
+    pub fn secondary_text(&self) -> Option<String> {
+        match self {
+            Self::Branch { .. } => None,
+            Self::Shared(worktree) => worktree
+                .head
+                .display_commit()
+                .map(|commit| format!("detached at {commit}")),
+        }
+    }
+
+    pub fn is_shared(&self) -> bool {
+        matches!(self, Self::Shared(_))
+    }
+
+    pub fn is_disabled(&self) -> bool {
+        matches!(
+            self,
+            Self::Branch {
+                checked_out_elsewhere: true,
+                ..
+            }
+        )
+    }
+
+    pub fn matches_query(&self, normalized_query: &str) -> bool {
+        let search_text = self.search_text();
+        normalized_query
+            .split_whitespace()
+            .all(|token| search_text.contains(token))
+    }
+
+    fn search_text(&self) -> String {
+        match self {
+            Self::Branch { name, .. } => name.to_ascii_lowercase(),
+            Self::Shared(worktree) => {
+                let mut text = format!(
+                    "{} {}",
+                    worktree.name.to_ascii_lowercase(),
+                    worktree.path.to_string_lossy().to_ascii_lowercase()
+                );
+                if let Some(branch) = worktree.head.branch() {
+                    text.push(' ');
+                    text.push_str(&branch.to_ascii_lowercase());
+                }
+                if let Some(commit) = worktree.head.commit() {
+                    text.push(' ');
+                    text.push_str(&commit.to_ascii_lowercase());
+                }
+                text
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BranchSnapshot {
     pub repository: PathBuf,
     pub current: Option<String>,
     pub detached_head: Option<String>,
     pub default_branch: Option<String>,
     pub branches: Vec<BranchEntry>,
+    pub remote_branches: Vec<String>,
     /// Working-tree changes against `HEAD`, including untracked text files,
     /// cached with the branch snapshot so environment UI never shells out from
     /// a render path.
@@ -131,6 +294,15 @@ pub fn inspect(cwd: &Path) -> anyhow::Result<Option<BranchSnapshot>> {
         .filter(|branch| branches.iter().any(|entry| entry.name == *branch))
         .map(str::to_owned)
         .or_else(|| current.clone());
+    let mut remote_branches = git_stdout(
+        cwd,
+        &["for-each-ref", "--format=%(refname:short)", "refs/remotes"],
+    )?
+    .lines()
+    .filter(|branch| !branch.is_empty() && !branch.ends_with("/HEAD"))
+    .map(str::to_owned)
+    .collect::<Vec<_>>();
+    remote_branches.sort();
     let (additions, deletions) = worktree_line_counts(&repository);
 
     Ok(Some(BranchSnapshot {
@@ -139,9 +311,253 @@ pub fn inspect(cwd: &Path) -> anyhow::Result<Option<BranchSnapshot>> {
         detached_head,
         default_branch,
         branches,
+        remote_branches,
         additions,
         deletions,
     }))
+}
+
+/// Enumerate every valid worktree registered for the repository containing
+/// `project_path`. The subprocess and path walks belong on a background
+/// executor; this function intentionally does not inspect dirty state.
+pub fn discover_worktrees(project_path: &Path) -> anyhow::Result<Option<WorktreeSnapshot>> {
+    let repository_output = Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(project_path)
+        .output()
+        .context("failed to execute git")?;
+    if !repository_output.status.success() {
+        return Ok(None);
+    }
+    let repository = canonicalize_or_original(PathBuf::from(
+        String::from_utf8_lossy(&repository_output.stdout)
+            .trim()
+            .to_owned(),
+    ));
+    let project_path = fs::canonicalize(project_path)
+        .with_context(|| format!("could not resolve project {}", project_path.display()))?;
+    let project_relative = project_path
+        .strip_prefix(&repository)
+        .context("project is outside its Git repository root")?
+        .to_owned();
+    let output = git_stdout(project_path.as_path(), &["worktree", "list", "--porcelain"])?;
+    let mut worktrees = parse_worktree_list(&output)
+        .into_iter()
+        .filter(|record| !record.prunable)
+        .filter_map(|record| {
+            let root = fs::canonicalize(record.root).ok()?;
+            if !root.is_dir() {
+                return None;
+            }
+            if !root.join(&project_relative).is_dir() {
+                return None;
+            }
+            let head = match (record.branch, record.head) {
+                (Some(branch), _) if !branch.is_empty() => WorktreeHead::Branch(branch),
+                (_, Some(commit)) if !commit.is_empty() => WorktreeHead::Detached { commit },
+                _ => return None,
+            };
+            Some(WorktreeEntry {
+                root,
+                head,
+                locked: record.locked,
+            })
+        })
+        .collect::<Vec<_>>();
+    worktrees.sort_by(|left, right| left.root.cmp(&right.root));
+    worktrees.dedup_by(|left, right| left.root == right.root);
+    Ok(Some(WorktreeSnapshot {
+        repository,
+        project_path,
+        project_relative,
+        worktrees,
+    }))
+}
+
+/// Re-read worktrees immediately before a shared selection is applied. The
+/// returned metadata is fresh, so a branch that moved to detached HEAD does
+/// not leave stale display data in the draft.
+pub fn validate_shared_worktree(
+    project_path: &Path,
+    selected_path: &Path,
+) -> anyhow::Result<Option<SharedWorktree>> {
+    let Some(snapshot) = discover_worktrees(project_path)? else {
+        return Ok(None);
+    };
+    let selected_path = canonicalize_or_original(selected_path.to_owned());
+    Ok(snapshot
+        .worktrees
+        .iter()
+        .find(|worktree| snapshot.project_path(worktree) == selected_path)
+        .filter(|worktree| snapshot.project_path(worktree).is_dir())
+        .map(|worktree| SharedWorktree {
+            path: snapshot.project_path(worktree),
+            name: worktree_name(&worktree.root),
+            head: worktree.head.clone(),
+        }))
+}
+
+pub fn short_commit(commit: &str) -> String {
+    commit.chars().take(7).collect()
+}
+
+fn canonicalize_or_original(path: PathBuf) -> PathBuf {
+    fs::canonicalize(&path).unwrap_or(path)
+}
+
+fn worktree_name(root: &Path) -> String {
+    root.file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| root.to_string_lossy().into_owned())
+}
+
+#[derive(Default)]
+struct WorktreeRecord {
+    root: PathBuf,
+    head: Option<String>,
+    branch: Option<String>,
+    locked: bool,
+    prunable: bool,
+}
+
+fn parse_worktree_list(output: &str) -> Vec<WorktreeRecord> {
+    let mut records = Vec::new();
+    let mut current = WorktreeRecord::default();
+    let mut has_record = false;
+    let finish =
+        |records: &mut Vec<WorktreeRecord>, current: &mut WorktreeRecord, has_record: &mut bool| {
+            if *has_record && !current.root.as_os_str().is_empty() {
+                records.push(std::mem::take(current));
+            }
+            *has_record = false;
+        };
+    for line in output.lines() {
+        if line.is_empty() {
+            finish(&mut records, &mut current, &mut has_record);
+            continue;
+        }
+        if let Some(root) = line.strip_prefix("worktree ") {
+            finish(&mut records, &mut current, &mut has_record);
+            current.root = PathBuf::from(root);
+            has_record = true;
+        } else if let Some(head) = line.strip_prefix("HEAD ") {
+            current.head = Some(head.to_owned());
+        } else if let Some(branch) = line.strip_prefix("branch refs/heads/") {
+            current.branch = Some(branch.to_owned());
+        } else if line == "locked" || line.starts_with("locked ") {
+            current.locked = true;
+        } else if line == "prunable" || line.starts_with("prunable ") {
+            current.prunable = true;
+        }
+    }
+    finish(&mut records, &mut current, &mut has_record);
+    records
+}
+
+/// Build the deterministic ref-picker model from public Git metadata.
+pub fn workspace_ref_entries(
+    snapshot: &BranchSnapshot,
+    worktrees: Option<&WorktreeSnapshot>,
+    excluded_worktree_paths: &[&Path],
+    normalized_query: &str,
+) -> Vec<WorkspaceRef> {
+    let shared = worktrees
+        .map(|worktrees| worktrees.shared_worktrees(excluded_worktree_paths))
+        .unwrap_or_default();
+    let shared_by_branch = shared
+        .iter()
+        .filter_map(|worktree| {
+            worktree
+                .head
+                .branch()
+                .map(|branch| (branch, worktree.clone()))
+        })
+        .collect::<HashMap<_, _>>();
+    let shared_branch_names = shared_by_branch
+        .keys()
+        .map(|branch| (*branch).to_owned())
+        .collect::<HashSet<_>>();
+    let current = snapshot.current.as_deref();
+    let default = snapshot
+        .default_branch
+        .as_deref()
+        .filter(|branch| Some(*branch) != current);
+    let mut refs = Vec::new();
+
+    if let Some(current) = current {
+        refs.push(pinned_ref(current, &shared_by_branch));
+    } else if let Some(detached_head) = snapshot.detached_head.as_deref() {
+        refs.push(WorkspaceRef::Branch {
+            name: short_commit(detached_head),
+            checked_out_elsewhere: false,
+        });
+    }
+    if let Some(default) = default {
+        refs.push(pinned_ref(default, &shared_by_branch));
+    }
+
+    let pinned_names = refs
+        .iter()
+        .filter_map(WorkspaceRef::branch_name)
+        .map(str::to_owned)
+        .collect::<HashSet<_>>();
+    let mut shared_refs = shared
+        .into_iter()
+        .filter(|worktree| {
+            worktree
+                .head
+                .branch()
+                .is_none_or(|branch| !pinned_names.contains(branch))
+        })
+        .map(WorkspaceRef::Shared)
+        .collect::<Vec<_>>();
+    shared_refs.sort_by(|left, right| {
+        left.display_name()
+            .cmp(right.display_name())
+            .then_with(|| left.secondary_text().cmp(&right.secondary_text()))
+    });
+    refs.extend(shared_refs);
+
+    let mut local = snapshot
+        .branches
+        .iter()
+        .filter(|branch| worktrees.is_none() || !branch.checked_out_elsewhere)
+        .filter(|branch| !pinned_names.contains(branch.name.as_str()))
+        .filter(|branch| !shared_branch_names.contains(branch.name.as_str()))
+        .map(|branch| WorkspaceRef::Branch {
+            name: branch.name.clone(),
+            checked_out_elsewhere: branch.checked_out_elsewhere,
+        })
+        .collect::<Vec<_>>();
+    local.sort_by(|left, right| left.display_name().cmp(right.display_name()));
+    refs.extend(local);
+
+    let mut remote = snapshot
+        .remote_branches
+        .iter()
+        .map(|name| WorkspaceRef::Branch {
+            name: name.clone(),
+            checked_out_elsewhere: false,
+        })
+        .collect::<Vec<_>>();
+    remote.sort_by(|left, right| left.display_name().cmp(right.display_name()));
+    refs.extend(remote);
+
+    refs.into_iter()
+        .filter(|entry| entry.matches_query(normalized_query))
+        .collect()
+}
+
+fn pinned_ref(branch: &str, shared_by_branch: &HashMap<&str, SharedWorktree>) -> WorkspaceRef {
+    shared_by_branch
+        .get(branch)
+        .map(|worktree| WorkspaceRef::Shared(worktree.clone()))
+        .unwrap_or_else(|| WorkspaceRef::Branch {
+            name: branch.to_owned(),
+            checked_out_elsewhere: false,
+        })
 }
 
 fn worktree_line_counts(cwd: &Path) -> (u64, u64) {
@@ -451,5 +867,214 @@ mod tests {
 
         let snapshot = inspect(&worktree).unwrap().unwrap();
         assert_eq!((snapshot.additions, snapshot.deletions), (3, 0));
+    }
+
+    #[test]
+    fn discovers_branch_detached_locked_and_skips_stale_worktrees() {
+        let repository = repository();
+        let branch_path = repository.with_extension("branch-worktree");
+        let detached_path = repository.with_extension("detached-worktree");
+        let stale_path = repository.with_extension("stale-worktree");
+        run_git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "linked",
+                branch_path.to_str().unwrap(),
+            ],
+        );
+        run_git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                detached_path.to_str().unwrap(),
+            ],
+        );
+        run_git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "stale",
+                stale_path.to_str().unwrap(),
+            ],
+        );
+        run_git(
+            &repository,
+            &[
+                "worktree",
+                "lock",
+                "--reason",
+                "test lock",
+                branch_path.to_str().unwrap(),
+            ],
+        );
+        fs::remove_dir_all(&stale_path).unwrap();
+
+        let snapshot = discover_worktrees(&repository).unwrap().unwrap();
+        let branch = snapshot
+            .worktrees
+            .iter()
+            .find(|worktree| worktree.root == fs::canonicalize(&branch_path).unwrap())
+            .unwrap();
+        assert_eq!(branch.head, WorktreeHead::Branch("linked".into()));
+        assert!(branch.locked);
+
+        let detached = snapshot
+            .worktrees
+            .iter()
+            .find(|worktree| worktree.root == fs::canonicalize(&detached_path).unwrap())
+            .unwrap();
+        let WorktreeHead::Detached { commit } = &detached.head else {
+            panic!("expected detached worktree");
+        };
+        assert_eq!(commit.len(), 40);
+        assert!(
+            snapshot
+                .worktrees
+                .iter()
+                .all(|worktree| worktree.root != stale_path)
+        );
+    }
+
+    #[test]
+    fn maps_a_nested_project_to_the_same_subdirectory_in_each_worktree() {
+        let repository = repository();
+        let project = repository.join("packages/app");
+        fs::create_dir_all(&project).unwrap();
+        fs::write(project.join("main.rs"), "fn main() {}\n").unwrap();
+        run_git(&repository, &["add", "."]);
+        run_git(
+            &repository,
+            &[
+                "-c",
+                "user.name=Waku Tests",
+                "-c",
+                "user.email=waku@example.com",
+                "commit",
+                "-m",
+                "nested project",
+            ],
+        );
+        let linked_root = repository.with_extension("nested-worktree");
+        run_git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "nested",
+                linked_root.to_str().unwrap(),
+            ],
+        );
+
+        let snapshot = discover_worktrees(&project).unwrap().unwrap();
+        assert_eq!(snapshot.project_relative, PathBuf::from("packages/app"));
+        let linked = snapshot
+            .worktrees
+            .iter()
+            .find(|worktree| worktree.head == WorktreeHead::Branch("nested".into()))
+            .unwrap();
+        assert_eq!(
+            snapshot.project_path(linked),
+            fs::canonicalize(linked_root).unwrap().join("packages/app")
+        );
+    }
+
+    #[test]
+    fn workspace_refs_are_grouped_sorted_and_search_detached_metadata() {
+        let snapshot = BranchSnapshot {
+            repository: PathBuf::from("/repo"),
+            current: Some("feature".into()),
+            detached_head: None,
+            default_branch: Some("main".into()),
+            branches: vec![
+                BranchEntry {
+                    name: "zulu".into(),
+                    checked_out_elsewhere: false,
+                },
+                BranchEntry {
+                    name: "apple".into(),
+                    checked_out_elsewhere: false,
+                },
+                BranchEntry {
+                    name: "stale".into(),
+                    checked_out_elsewhere: true,
+                },
+                BranchEntry {
+                    name: "feature".into(),
+                    checked_out_elsewhere: false,
+                },
+                BranchEntry {
+                    name: "main".into(),
+                    checked_out_elsewhere: false,
+                },
+            ],
+            remote_branches: vec!["origin/zulu".into(), "origin/main".into()],
+            additions: 0,
+            deletions: 0,
+        };
+        let worktrees = WorktreeSnapshot {
+            repository: PathBuf::from("/repo"),
+            project_path: PathBuf::from("/repo"),
+            project_relative: PathBuf::new(),
+            worktrees: vec![
+                WorktreeEntry {
+                    root: PathBuf::from("/repo"),
+                    head: WorktreeHead::Branch("feature".into()),
+                    locked: false,
+                },
+                WorktreeEntry {
+                    root: PathBuf::from("/worktrees/zulu"),
+                    head: WorktreeHead::Branch("shared/zulu".into()),
+                    locked: true,
+                },
+                WorktreeEntry {
+                    root: PathBuf::from("/worktrees/apple"),
+                    head: WorktreeHead::Detached {
+                        commit: "deadbeef1234567890abcdef1234567890abcdef".into(),
+                    },
+                    locked: false,
+                },
+            ],
+        };
+
+        let refs = workspace_ref_entries(&snapshot, Some(&worktrees), &[Path::new("/repo")], "");
+        assert_eq!(
+            refs.iter()
+                .map(WorkspaceRef::display_name)
+                .collect::<Vec<_>>(),
+            vec![
+                "feature",
+                "main",
+                "apple",
+                "shared/zulu",
+                "apple",
+                "zulu",
+                "origin/main",
+                "origin/zulu"
+            ]
+        );
+        assert!(refs.iter().any(|entry| {
+            matches!(
+                entry,
+                WorkspaceRef::Shared(worktree)
+                    if worktree.name == "apple"
+                        && worktree.head.commit() == Some("deadbeef1234567890abcdef1234567890abcdef")
+            )
+        }));
+        let by_commit = workspace_ref_entries(
+            &snapshot,
+            Some(&worktrees),
+            &[Path::new("/repo")],
+            "deadbeef",
+        );
+        assert_eq!(by_commit.len(), 1);
+        assert!(by_commit[0].is_shared());
     }
 }

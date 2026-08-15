@@ -720,9 +720,10 @@ impl Waku {
                     SessionWorkspace::NewWorktree { base_branch } => {
                         (String::new(), base_branch.as_deref())
                     }
-                    SessionWorkspace::Worktree { path, branch } => {
-                        (path.to_string_lossy().into_owned(), Some(branch.as_str()))
-                    }
+                    SessionWorkspace::Worktree { path, branch, .. } => (
+                        path.to_string_lossy().into_owned(),
+                        branch.as_deref(),
+                    ),
                 };
                 // Automation runs are sessions; tag them with the automation's
                 // name so a run is recognizable and searchable by it.

@@ -2203,7 +2203,8 @@ mod tests {
         state.sessions[0].auto_title = Some("Investigate".into());
         state.sessions[0].workspace = SessionWorkspace::Worktree {
             path: PathBuf::from("/tmp/worktrees/investigate"),
-            branch: "waku/investigate".into(),
+            branch: Some("waku/investigate".into()),
+            detached_head: None,
         };
         state.sessions[0].begin_turn("Ask");
         state.sessions[0].push_message(MessageRole::Assistant, "an answer");
@@ -2236,7 +2237,8 @@ mod tests {
             session.workspace,
             SessionWorkspace::Worktree {
                 path: PathBuf::from("/tmp/worktrees/investigate"),
-                branch: "waku/investigate".into(),
+                branch: Some("waku/investigate".into()),
+                detached_head: None,
             }
         );
         assert!(
@@ -2245,6 +2247,38 @@ mod tests {
                 .iter()
                 .any(|message| message.content == "an answer")
         );
+
+        fs::remove_dir_all(directory).ok();
+    }
+
+    #[test]
+    fn multiple_sessions_round_trip_the_same_detached_worktree_path() {
+        let directory = temporary_directory();
+        let store = store_in(&directory);
+        let mut state = PersistedState::fresh(PathBuf::from("/tmp/project"));
+        let project_id = state.projects[0].id;
+        let shared_workspace = SessionWorkspace::Worktree {
+            path: PathBuf::from("/tmp/worktrees/detached"),
+            branch: None,
+            detached_head: Some("0123456789abcdef0123456789abcdef01234567".into()),
+        };
+        state.sessions[0].workspace = shared_workspace.clone();
+        state.sessions[0].begin_turn("first");
+        state.sessions[0].finish_active_turn(crate::model::TurnStatus::Completed);
+        let mut second = state.new_session(project_id, ProviderKind::Codex);
+        second.workspace = shared_workspace.clone();
+        second.begin_turn("second");
+        second.finish_active_turn(crate::model::TurnStatus::Completed);
+        state.push_session(second);
+        store.save(&mut state).unwrap();
+
+        let reopened = store_in(&directory);
+        let mut restored = reopened.load().unwrap();
+        assert_eq!(restored.sessions.len(), 2);
+        reopened.hydrate(&mut restored.sessions[0]).unwrap();
+        reopened.hydrate(&mut restored.sessions[1]).unwrap();
+        assert_eq!(restored.sessions[0].workspace, shared_workspace);
+        assert_eq!(restored.sessions[1].workspace, shared_workspace);
 
         fs::remove_dir_all(directory).ok();
     }

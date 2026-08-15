@@ -547,9 +547,17 @@ pub enum SessionWorkspace {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         base_branch: Option<String>,
     },
-    /// A materialized worktree. `path` preserves a project that points at a
-    /// subdirectory of its repository rather than the repository root itself.
-    Worktree { path: PathBuf, branch: String },
+    /// An existing or newly materialized worktree. `path` preserves a project
+    /// that points at a subdirectory of its repository rather than the
+    /// repository root itself. Detached worktrees keep their commit instead
+    /// of inventing a branch name.
+    Worktree {
+        path: PathBuf,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        branch: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detached_head: Option<String>,
+    },
 }
 
 impl SessionWorkspace {
@@ -3049,6 +3057,36 @@ mod tests {
         };
         let restored = serde_json::from_value(serde_json::to_value(&selected).unwrap()).unwrap();
         assert_eq!(selected, restored);
+    }
+
+    #[test]
+    fn detached_worktree_head_round_trips_without_a_fabricated_branch() {
+        let selected = SessionWorkspace::Worktree {
+            path: PathBuf::from("/tmp/worktrees/detached"),
+            branch: None,
+            detached_head: Some("0123456789abcdef".into()),
+        };
+        let serialized = serde_json::to_value(&selected).unwrap();
+        assert_eq!(serialized["kind"], "worktree");
+        assert_eq!(serialized["detachedHead"], "0123456789abcdef");
+        assert!(serialized.get("branch").is_none());
+        let restored: SessionWorkspace = serde_json::from_value(serialized).unwrap();
+        assert_eq!(restored, selected);
+
+        let legacy: SessionWorkspace = serde_json::from_value(serde_json::json!({
+            "kind": "worktree",
+            "path": "/tmp/worktrees/branch",
+            "branch": "waku/branch"
+        }))
+        .unwrap();
+        assert_eq!(
+            legacy,
+            SessionWorkspace::Worktree {
+                path: PathBuf::from("/tmp/worktrees/branch"),
+                branch: Some("waku/branch".into()),
+                detached_head: None,
+            }
+        );
     }
 
     #[test]

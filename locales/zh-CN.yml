@@ -400,9 +400,14 @@ branches.create_hint: 按 Return 创建 · 按 Esc 取消
 branches.none_found: 未找到分支
 branches.create_and_checkout_ellipsis: 创建并切换到新分支…
 branches.title: 分支
+branches.shared_label: shared
 workspace.work_in: 工作位置
 workspace.local: 本地
 workspace.new_worktree: 新建工作树
+workspace.shared_worktree: 共享工作树
+workspace.shared_worktree_branch: "共享工作树（%{branch}）"
+workspace.shared_worktree_detached: "共享工作树（%{commit}）"
+workspace.unavailable: 工作区不可用
 workspace.workspace: 工作区
 workspace.worktree: 工作树
 terminal.starting: 正在启动终端…
@@ -446,6 +451,8 @@ errors.project_not_found: 找不到项目
 errors.prepare_task_project_not_found: 无法准备任务：找不到项目
 errors.store_pasted_image: "无法添加粘贴的图片：%{error}"
 errors.create_worktree: "无法创建工作树：%{error}"
+errors.stale_worktree_selection: 共享工作树已不可用。选择器已刷新。
+errors.workspace_unavailable: 工作区不可用
 errors.prepared_runtime_unavailable: 已准备的智能体运行环境不可用
 errors.start_agent: "无法启动智能体：%{error}"
 errors.provider_no_active_turn: "%{provider} 当前没有可补充指示的任务"

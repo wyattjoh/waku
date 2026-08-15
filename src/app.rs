@@ -25,7 +25,7 @@ use crate::computer_use::{
     ComputerPermissions, ComputerUsePhase, ComputerUseState, PendingComputerApproval,
 };
 use crate::driver::{self, DriverHandle, DriverStartOptions, SessionOptions};
-use crate::git_branch::BranchSnapshot;
+use crate::git_branch::{BranchSnapshot, WorkspaceRef, WorktreeSnapshot};
 use crate::input::{ComposerAttachmentPaste, ComposerEvent, ComposerInput};
 use crate::md;
 use crate::model::{
@@ -190,7 +190,7 @@ enum BranchPickerMode {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum BranchPickerAction {
-    Checkout(String),
+    Select(WorkspaceRef),
     Create,
 }
 
@@ -954,10 +954,17 @@ pub struct Waku {
     /// rows remain visible but never enter this index.
     branch_picker_highlight: Option<usize>,
     branch_picker_list_state: ListState,
-    branch_picker_row_cache: RefCell<Vec<crate::git_branch::BranchEntry>>,
+    branch_picker_row_cache: RefCell<Vec<WorkspaceRef>>,
     /// Git subprocess results per concrete workspace path. Render only reads
     /// this in-memory cache; misses are fulfilled on the background executor.
     branch_snapshots: QueryCache<PathBuf, Result<Option<BranchSnapshot>, String>>,
+    /// Repository-level worktree discovery. It is keyed by the project path,
+    /// not by the selected task path, so every linked checkout shares one
+    /// background result.
+    worktree_snapshots: QueryCache<PathBuf, Result<Option<WorktreeSnapshot>, String>>,
+    /// Filesystem availability for a pinned materialized workspace. Render
+    /// reads this cache and never probes the path directly.
+    workspace_availability: QueryCache<PathBuf, bool>,
     /// Stale-while-revalidate value for the selected path, avoiding label
     /// flicker when app activation invalidates the query.
     visible_branch_snapshot: Option<(PathBuf, BranchSnapshot)>,
@@ -2360,6 +2367,8 @@ impl Waku {
                 branch_picker_list_state,
                 branch_picker_row_cache: RefCell::new(Vec::new()),
                 branch_snapshots: QueryCache::new(MAX_CACHED_WORKSPACES),
+                worktree_snapshots: QueryCache::new(MAX_CACHED_WORKSPACES),
+                workspace_availability: QueryCache::new(MAX_CACHED_WORKSPACES),
                 visible_branch_snapshot: None,
                 branch_operation_pending: false,
                 commit_dialog: None,

@@ -5,8 +5,31 @@ enum BranchOperation {
     Create(String),
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum WorkspaceSelectionPlan {
+    BindShared(crate::git_branch::SharedWorktree),
+    SetNewWorktreeBase(String),
+    CheckoutInCurrent(String),
+}
+
+pub(super) fn plan_workspace_selection(
+    workspace: &SessionWorkspace,
+    selection: &WorkspaceRef,
+) -> WorkspaceSelectionPlan {
+    match selection {
+        WorkspaceRef::Shared(worktree) => WorkspaceSelectionPlan::BindShared(worktree.clone()),
+        WorkspaceRef::Branch { name, .. } => {
+            if matches!(workspace, SessionWorkspace::NewWorktree { .. }) {
+                WorkspaceSelectionPlan::SetNewWorktreeBase(name.clone())
+            } else {
+                WorkspaceSelectionPlan::CheckoutInCurrent(name.clone())
+            }
+        }
+    }
+}
+
 impl Waku {
-    pub(super) fn sync_branch_picker_rows(&self, rows: &[crate::git_branch::BranchEntry]) {
+    pub(super) fn sync_branch_picker_rows(&self, rows: &[WorkspaceRef]) {
         let mut cached = self.branch_picker_row_cache.borrow_mut();
         if cached.as_slice() == rows {
             return;
@@ -14,6 +37,73 @@ impl Waku {
         *cached = rows.to_vec();
         self.branch_picker_list_state
             .reset_with_uniform_height(rows.len(), px(BRANCH_PICKER_ROW_HEIGHT));
+    }
+
+    /// Discover all repository worktrees off the render path. A project path
+    /// is the cache key because a nested project must map to the same relative
+    /// directory in every linked worktree.
+    pub(super) fn worktree_snapshot_for_project(
+        &mut self,
+        project_path: &std::path::Path,
+        cx: &mut Context<Self>,
+    ) -> Option<WorktreeSnapshot> {
+        let project_path = project_path.to_path_buf();
+        match self.worktree_snapshots.read(&project_path) {
+            Query::Ready(result) => match result.as_ref() {
+                Ok(Some(snapshot)) => Some(snapshot.clone()),
+                Ok(None) | Err(_) => None,
+            },
+            Query::Pending => None,
+            Query::Missing(token) => {
+                let fetch_path = project_path.clone();
+                cx.spawn(async move |waku, cx| {
+                    let result = cx
+                        .background_executor()
+                        .spawn(async move {
+                            crate::git_branch::discover_worktrees(&fetch_path)
+                                .map_err(|error| error.to_string())
+                        })
+                        .await;
+                    let _ = waku.update(cx, |waku, cx| {
+                        if waku.worktree_snapshots.fulfill(token, result) {
+                            cx.notify();
+                        }
+                    });
+                })
+                .detach();
+                None
+            }
+        }
+    }
+
+    /// Cache whether a pinned workspace still exists. Render only reads this
+    /// result and never probes the filesystem directly.
+    pub(super) fn workspace_is_available(
+        &mut self,
+        workspace_path: &std::path::Path,
+        cx: &mut Context<Self>,
+    ) -> Option<bool> {
+        let workspace_path = workspace_path.to_path_buf();
+        match self.workspace_availability.read(&workspace_path) {
+            Query::Ready(available) => Some(*available),
+            Query::Pending => None,
+            Query::Missing(token) => {
+                let fetch_path = workspace_path.clone();
+                cx.spawn(async move |waku, cx| {
+                    let available = cx
+                        .background_executor()
+                        .spawn(async move { fetch_path.is_dir() })
+                        .await;
+                    let _ = waku.update(cx, |waku, cx| {
+                        if waku.workspace_availability.fulfill(token, available) {
+                            cx.notify();
+                        }
+                    });
+                })
+                .detach();
+                None
+            }
+        }
     }
 
     /// Read the selected workspace's cached Git branches, starting one
@@ -75,14 +165,22 @@ impl Waku {
                             match result {
                                 Ok(Some(snapshot)) => {
                                     let mut persisted_branch_changed = false;
-                                    if let Some(current) = snapshot.current.as_deref()
-                                        && let Some(session) = waku.selected_session_mut()
-                                        && let SessionWorkspace::Worktree { branch, .. } =
-                                            &mut session.workspace
-                                        && branch != current
+                                    if let Some(session) = waku.selected_session_mut()
+                                        && let SessionWorkspace::Worktree {
+                                            branch,
+                                            detached_head,
+                                            ..
+                                        } = &mut session.workspace
                                     {
-                                        *branch = current.to_owned();
-                                        persisted_branch_changed = true;
+                                        let next_branch = snapshot.current.clone();
+                                        let next_detached_head = snapshot.detached_head.clone();
+                                        if *branch != next_branch
+                                            || *detached_head != next_detached_head
+                                        {
+                                            *branch = next_branch;
+                                            *detached_head = next_detached_head;
+                                            persisted_branch_changed = true;
+                                        }
                                     }
                                     waku.visible_branch_snapshot = Some((fetch_path, snapshot));
                                     if persisted_branch_changed {
@@ -103,76 +201,120 @@ impl Waku {
     }
 
     pub(super) fn refresh_selected_branch_snapshot(&mut self, cx: &mut Context<Self>) {
+        let project_path = self.selected_project().map(|project| project.path.clone());
         let Some(path) = self
             .selected_workspace_path()
             .map(std::path::Path::to_path_buf)
         else {
             self.visible_branch_snapshot = None;
+            if let Some(project_path) = project_path {
+                self.worktree_snapshots.invalidate(&project_path);
+            }
             return;
         };
         self.branch_snapshots.invalidate(&path);
+        self.workspace_availability.invalidate(&path);
+        if let Some(project_path) = project_path {
+            self.worktree_snapshots.invalidate(&project_path);
+        }
         cx.notify();
     }
 
-    /// Select an existing branch. A planned worktree remembers it as the base
-    /// ref without touching the ordinary checkout; concrete workspaces run a
-    /// real `git switch` on the background executor.
-    ///
-    /// `true` asks the caller to dismiss the picker after this entity update
-    /// ends. Closing sooner runs the toggle observer, which re-enters `Waku`
-    /// and double-leases the entity.
-    pub(super) fn choose_workspace_branch(
+    /// Apply a picker selection. Existing worktrees are validated again on
+    /// the click path, while ordinary branch operations retain their existing
+    /// background Git mutation.
+    pub(super) fn choose_workspace_ref(
         &mut self,
-        branch: String,
+        selection: WorkspaceRef,
         cx: &mut Context<Self>,
     ) -> bool {
         let Some(session) = self.selected_session() else {
             return false;
         };
-        if session.is_busy() || self.branch_operation_pending {
+        if session.has_started() || session.is_busy() || self.branch_operation_pending {
             return false;
         }
-        if matches!(session.workspace, SessionWorkspace::NewWorktree { .. }) {
-            let changed = self.selected_session_mut().is_some_and(|session| {
-                let SessionWorkspace::NewWorktree { base_branch } = &mut session.workspace else {
+        let plan = plan_workspace_selection(&session.workspace, &selection);
+        match plan {
+            WorkspaceSelectionPlan::BindShared(shared) => {
+                let Some(project_path) =
+                    self.selected_project().map(|project| project.path.clone())
+                else {
                     return false;
                 };
-                if base_branch.as_deref() == Some(branch.as_str()) {
-                    return false;
-                }
-                *base_branch = Some(branch);
+                let validated =
+                    crate::git_branch::validate_shared_worktree(&project_path, &shared.path)
+                        .ok()
+                        .flatten();
+                let Some(validated) = validated else {
+                    self.refresh_selected_branch_snapshot(cx);
+                    self.show_toast(tr!("errors.stale_worktree_selection"));
+                    cx.notify();
+                    return true;
+                };
+                let workspace = SessionWorkspace::Worktree {
+                    path: validated.path,
+                    branch: validated.head.branch().map(str::to_owned),
+                    detached_head: validated.head.commit().map(str::to_owned),
+                };
+                self.select_workspace(workspace, cx);
                 true
-            });
-            if changed {
-                self.save();
-                cx.notify();
             }
-            return true;
+            WorkspaceSelectionPlan::SetNewWorktreeBase(branch) => {
+                let changed = self.selected_session_mut().is_some_and(|session| {
+                    let SessionWorkspace::NewWorktree { base_branch } = &mut session.workspace
+                    else {
+                        return false;
+                    };
+                    if base_branch.as_deref() == Some(branch.as_str()) {
+                        return false;
+                    }
+                    *base_branch = Some(branch);
+                    true
+                });
+                if changed {
+                    self.save();
+                    cx.notify();
+                }
+                true
+            }
+            WorkspaceSelectionPlan::CheckoutInCurrent(branch) => {
+                let selected_path = self
+                    .selected_workspace_path()
+                    .map(std::path::Path::to_path_buf);
+                let already_current = selected_path.as_ref().is_some_and(|path| {
+                    self.visible_branch_snapshot
+                        .as_ref()
+                        .filter(|(snapshot_path, _)| snapshot_path == path)
+                        .is_some_and(|(_, snapshot)| {
+                            snapshot.current.as_deref() == Some(branch.as_str())
+                                || snapshot.detached_head.as_deref().is_some_and(|head| {
+                                    crate::git_branch::short_commit(head) == branch
+                                })
+                        })
+                });
+                if already_current {
+                    return true;
+                }
+                let Some(project_path) =
+                    self.selected_project().map(|project| project.path.clone())
+                else {
+                    return false;
+                };
+                if !session.workspace.is_local() {
+                    self.select_workspace(SessionWorkspace::Local, cx);
+                }
+                self.start_branch_operation(project_path, BranchOperation::Checkout(branch), cx);
+                true
+            }
         }
-
-        let Some(path) = self
-            .selected_workspace_path()
-            .map(std::path::Path::to_path_buf)
-        else {
-            return false;
-        };
-        if self
-            .visible_branch_snapshot
-            .as_ref()
-            .filter(|(snapshot_path, _)| snapshot_path == &path)
-            .and_then(|(_, snapshot)| snapshot.current.as_deref())
-            == Some(branch.as_str())
-        {
-            return true;
-        }
-        self.start_branch_operation(path, BranchOperation::Checkout(branch), cx);
-        true
     }
 
     pub(super) fn begin_branch_creation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.branch_operation_pending
             || self.selected_session().is_none_or(|session| {
-                session.is_busy()
+                session.has_started()
+                    || session.is_busy()
                     || matches!(session.workspace, SessionWorkspace::NewWorktree { .. })
             })
         {
@@ -232,12 +374,12 @@ impl Waku {
             (_, None) => 0,
         };
         self.branch_picker_highlight = Some(next);
-        if let Some(BranchPickerAction::Checkout(branch)) = actions.get(next)
+        if let Some(BranchPickerAction::Select(selection)) = actions.get(next)
             && let Some(row) = self
                 .branch_picker_row_cache
                 .borrow()
                 .iter()
-                .position(|entry| entry.name == *branch)
+                .position(|entry| entry == selection)
         {
             self.branch_picker_list_state.scroll_to_reveal_item(row);
         }
@@ -259,8 +401,8 @@ impl Waku {
             return false;
         };
         match action {
-            BranchPickerAction::Checkout(branch) => {
-                self.choose_workspace_branch(branch.clone(), cx)
+            BranchPickerAction::Select(selection) => {
+                self.choose_workspace_ref(selection.clone(), cx)
             }
             BranchPickerAction::Create => {
                 self.begin_branch_creation(window, cx);
@@ -310,10 +452,14 @@ impl Waku {
                         if selected_path.as_ref() == Some(&path) {
                             if let Some(current) = current
                                 && let Some(session) = waku.selected_session_mut()
-                                && let SessionWorkspace::Worktree { branch, .. } =
-                                    &mut session.workspace
+                                && let SessionWorkspace::Worktree {
+                                    branch,
+                                    detached_head,
+                                    ..
+                                } = &mut session.workspace
                             {
-                                *branch = current;
+                                *branch = Some(current);
+                                *detached_head = None;
                             }
                             waku.invalidate_workspace_queries(cx);
                             waku.reload_clean_right_panel_file_editors(cx);

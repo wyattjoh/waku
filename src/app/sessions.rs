@@ -117,6 +117,10 @@ impl Waku {
             return;
         };
         self.branch_snapshots.invalidate(&workspace_path);
+        self.workspace_availability.invalidate(&workspace_path);
+        if let Some(project_path) = self.selected_project().map(|project| project.path.clone()) {
+            self.worktree_snapshots.invalidate(&project_path);
+        }
         self.refresh_workspace_surfaces(cx);
         self.invalidate_composer_sources(cx);
     }

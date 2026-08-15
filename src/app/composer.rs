@@ -25,7 +25,7 @@ pub(super) fn composer_submit_action(
 /// access, agent preset, interaction mode) read from and write to. The composer
 /// edits the selected session live; the automations editor edits the open
 /// [`AutomationEditor`] form with no driver side effects.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub(super) enum AgentControlTarget {
     /// The currently selected session (composer).
     Session,
@@ -1005,7 +1005,7 @@ impl Waku {
     /// The Local / New worktree chip shared by the composer footer and the
     /// automation editor. The branch selector stays composer-only.
     pub(super) fn render_workspace_kind_control(
-        &self,
+        &mut self,
         target: AgentControlTarget,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -1013,12 +1013,28 @@ impl Waku {
         let can_configure = self.control_can_configure_workspace(target);
         let no_project_selected = self.control_no_project_selected(target);
         let workspace = self.control_workspace(target);
-        let workspace_label = match &workspace {
-            SessionWorkspace::Local => SharedString::from(tr!("workspace.local")),
-            SessionWorkspace::NewWorktree { .. } => {
-                SharedString::from(tr!("workspace.new_worktree"))
+        let workspace_path = (target == AgentControlTarget::Session)
+            .then(|| {
+                self.selected_workspace_path()
+                    .map(std::path::Path::to_path_buf)
+            })
+            .flatten();
+        let workspace_unavailable = workspace_path
+            .as_deref()
+            .filter(|_| matches!(workspace, SessionWorkspace::Worktree { .. }))
+            .is_some_and(|path| self.workspace_is_available(path, cx) == Some(false));
+        let workspace_label = if workspace_unavailable {
+            SharedString::from(tr!("workspace.unavailable"))
+        } else {
+            match &workspace {
+                SessionWorkspace::Local => SharedString::from(tr!("workspace.local")),
+                SessionWorkspace::NewWorktree { .. } => {
+                    SharedString::from(tr!("workspace.new_worktree"))
+                }
+                SessionWorkspace::Worktree { .. } => {
+                    SharedString::from(tr!("workspace.shared_worktree"))
+                }
             }
-            SessionWorkspace::Worktree { branch, .. } => SharedString::from(branch.clone()),
         };
         let workspace_icon = if workspace.is_local() {
             "icons/laptop.svg"
@@ -1038,7 +1054,31 @@ impl Waku {
         }
 
         let local_selected = workspace.is_local();
-        let worktree_selected = workspace.is_worktree();
+        let worktree_selected = matches!(workspace, SessionWorkspace::NewWorktree { .. });
+        let shared_selected = matches!(target, AgentControlTarget::Session)
+            && matches!(workspace, SessionWorkspace::Worktree { .. });
+        let shared_label = match &workspace {
+            SessionWorkspace::Worktree {
+                branch: Some(branch),
+                ..
+            } => tr!("workspace.shared_worktree_branch", branch = branch.clone()),
+            SessionWorkspace::Worktree {
+                detached_head: Some(commit),
+                ..
+            } => tr!(
+                "workspace.shared_worktree_detached",
+                commit = crate::git_branch::short_commit(commit)
+            ),
+            SessionWorkspace::Worktree { path, .. } => {
+                let name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| tr!("workspace.workspace"));
+                tr!("workspace.shared_worktree_detached", commit = name)
+            }
+            SessionWorkspace::Local | SessionWorkspace::NewWorktree { .. } => String::new(),
+        };
         let weak = cx.entity().downgrade();
         dropdown_menu(
             worktree_trigger,
@@ -1048,8 +1088,16 @@ impl Waku {
             move |_| {
                 let local = weak.clone();
                 let worktree = weak.clone();
-                vec![
-                    MenuItem::Header(tr!("workspace.work_in").into()),
+                let mut items = vec![MenuItem::Header(tr!("workspace.work_in").into())];
+                if shared_selected {
+                    items.push(
+                        MenuItem::new(shared_label.clone(), |_, _| {})
+                            .icon("icons/fork.svg")
+                            .selected(true)
+                            .disabled(true),
+                    );
+                }
+                items.extend([
                     MenuItem::new(tr!("workspace.local"), move |_, cx| {
                         let _ = local.update(cx, |this, cx| {
                             this.control_select_workspace_local(target, cx);
@@ -1065,7 +1113,8 @@ impl Waku {
                     .icon("icons/fork.svg")
                     .selected(worktree_selected)
                     .disabled(no_project_selected),
-                ]
+                ]);
+                items
             },
         )
     }
@@ -2772,22 +2821,44 @@ impl Waku {
         let session = self.selected_session()?;
         let workspace = session.workspace.clone();
         let workspace_path = self.workspace_path_for_session(session)?.to_path_buf();
-        self.selected_project()
-            .filter(|project| !project.is_projectless())?;
-        let branch_enabled = !session.is_busy() && !self.branch_operation_pending;
+        let project_path = self
+            .selected_project()
+            .filter(|project| !project.is_projectless())
+            .map(|project| project.path.clone())?;
+        let branch_enabled =
+            !session.has_started() && !session.is_busy() && !self.branch_operation_pending;
         let planned_worktree = matches!(workspace, SessionWorkspace::NewWorktree { .. });
-        let snapshot = self.branch_snapshot_for_workspace(&workspace_path, cx)?;
+        let snapshot = self
+            .branch_snapshot_for_workspace(&workspace_path, cx)
+            .or_else(|| self.branch_snapshot_for_workspace(&project_path, cx))?;
+        let worktrees = self.worktree_snapshot_for_project(&project_path, cx);
         let selected_branch = match &workspace {
-            SessionWorkspace::Local => snapshot.display_branch().map(str::to_owned),
+            SessionWorkspace::Local => snapshot.current.clone().or_else(|| {
+                snapshot
+                    .detached_head
+                    .as_deref()
+                    .map(crate::git_branch::short_commit)
+            }),
             SessionWorkspace::NewWorktree { base_branch } => base_branch
                 .clone()
                 .or_else(|| snapshot.default_branch.clone())
-                .or_else(|| snapshot.display_branch().map(str::to_owned)),
+                .or_else(|| snapshot.current.clone())
+                .or_else(|| {
+                    snapshot
+                        .detached_head
+                        .as_deref()
+                        .map(crate::git_branch::short_commit)
+                }),
             SessionWorkspace::Worktree { branch, .. } => snapshot
                 .current
                 .clone()
-                .or_else(|| Some(branch.clone()))
-                .or_else(|| snapshot.detached_head.clone()),
+                .or_else(|| branch.clone())
+                .or_else(|| {
+                    snapshot
+                        .detached_head
+                        .as_deref()
+                        .map(crate::git_branch::short_commit)
+                }),
         }
         .unwrap_or_else(|| tr!("branches.detached_head"));
 
@@ -2855,19 +2926,27 @@ impl Waku {
             .content()
             .trim()
             .to_ascii_lowercase();
-        let visible_branches = Rc::new(
+        let excluded_worktree_paths: [&Path; 2] =
+            [project_path.as_path(), workspace_path.as_path()];
+        let visible_refs = Rc::new(
             if handle.is_open() && self.branch_picker_mode == BranchPickerMode::Browse {
-                visible_branch_entries(&snapshot.branches, &selected_branch, &normalized_query)
+                crate::git_branch::workspace_ref_entries(
+                    &snapshot,
+                    worktrees.as_ref(),
+                    &excluded_worktree_paths,
+                    &normalized_query,
+                )
             } else {
                 Vec::new()
             },
         );
         let allow_create = !planned_worktree;
         let actions = Rc::new(
-            visible_branches
+            visible_refs
                 .iter()
-                .filter(|branch| planned_worktree || !branch.checked_out_elsewhere)
-                .map(|branch| BranchPickerAction::Checkout(branch.name.clone()))
+                .filter(|entry| !entry.is_disabled())
+                .cloned()
+                .map(BranchPickerAction::Select)
                 .chain(allow_create.then_some(BranchPickerAction::Create))
                 .collect::<Vec<_>>(),
         );
@@ -2876,7 +2955,7 @@ impl Waku {
             .filter(|index| *index < actions.len());
         let mode = self.branch_picker_mode;
         if handle.is_open() && mode == BranchPickerMode::Browse {
-            self.sync_branch_picker_rows(&visible_branches);
+            self.sync_branch_picker_rows(&visible_refs);
         }
         let branch_list = self.branch_picker_list_state.clone();
 
@@ -2931,7 +3010,7 @@ impl Waku {
                         )
                         .into_any_element()
                 } else {
-                    let rows = if visible_branches.is_empty() {
+                    let rows = if visible_refs.is_empty() {
                         div()
                             .id("branch-picker-list-empty")
                             .h(px(64.0))
@@ -2944,13 +3023,14 @@ impl Waku {
                             .child(tr!("branches.none_found"))
                             .into_any_element()
                     } else {
-                        let list_branches = visible_branches.clone();
+                        let list_refs = visible_refs.clone();
                         let list_actions = actions.clone();
+                        let list_workspace = workspace.clone();
                         let list_selected_branch = selected_branch.clone();
                         let list_weak = weak.clone();
                         let list_popover = popover.clone();
                         let height =
-                            (visible_branches.len() as f32 * BRANCH_PICKER_ROW_HEIGHT).min(260.0);
+                            (visible_refs.len() as f32 * BRANCH_PICKER_ROW_HEIGHT).min(260.0);
                         div()
                             .id("branch-picker-list")
                             .w_full()
@@ -2959,19 +3039,22 @@ impl Waku {
                             .px(px(4.0))
                             .child(
                                 list(branch_list.clone(), move |index, _window, _cx| {
-                                    let Some(branch) = list_branches.get(index) else {
+                                    let Some(entry) = list_refs.get(index) else {
                                         return div().into_any_element();
                                     };
-                                    let selected = branch.name == list_selected_branch;
-                                    let disabled =
-                                        branch.checked_out_elsewhere && !planned_worktree;
+                                    let selected = workspace_ref_is_selected(
+                                        entry,
+                                        &list_workspace,
+                                        &list_selected_branch,
+                                    );
+                                    let disabled = entry.is_disabled();
                                     let highlighted = highlight
                                         .and_then(|index| list_actions.get(index))
                                         .is_some_and(|action| {
                                             matches!(
                                                 action,
-                                                BranchPickerAction::Checkout(name)
-                                                    if name == &branch.name
+                                                BranchPickerAction::Select(selection)
+                                                    if selection == entry
                                             )
                                         });
                                     let color = if disabled {
@@ -2979,11 +3062,14 @@ impl Waku {
                                     } else {
                                         theme.text
                                     };
+                                    let shared = entry.is_shared();
+                                    let shared_color = theme.gauge;
+                                    let primary = entry.display_name().to_owned();
+                                    let secondary = entry.secondary_text();
+                                    let entry_id =
+                                        format!("branch-row-{index}-{}", entry.display_name());
                                     let row = div()
-                                        .id(SharedString::from(format!(
-                                            "branch-row-{}",
-                                            branch.name
-                                        )))
+                                        .id(SharedString::from(entry_id))
                                         .w_full()
                                         .h(px(BRANCH_PICKER_ROW_HEIGHT))
                                         .px(px(8.0))
@@ -3000,17 +3086,52 @@ impl Waku {
                                                 .hover(|element| element.bg(theme.overlay))
                                                 .active(|element| element.opacity(0.85))
                                         })
-                                        .child(icon("icons/git-branch.svg", 12.0, color))
+                                        .child(icon(
+                                            if shared {
+                                                "icons/fork.svg"
+                                            } else {
+                                                "icons/git-branch.svg"
+                                            },
+                                            12.0,
+                                            color,
+                                        ))
                                         .child(
                                             div()
                                                 .min_w_0()
                                                 .flex_1()
-                                                .truncate()
+                                                .flex()
+                                                .items_center()
                                                 .text_size(px(11.5))
                                                 .line_height(px(15.0))
-                                                .text_color(color)
-                                                .child(SharedString::from(branch.name.clone())),
+                                                .child(
+                                                    div()
+                                                        .min_w_0()
+                                                        .flex_1()
+                                                        .truncate()
+                                                        .text_color(color)
+                                                        .child(SharedString::from(primary)),
+                                                )
+                                                .when_some(secondary, |element, secondary| {
+                                                    element.child(
+                                                        div()
+                                                            .flex_none()
+                                                            .text_color(theme.text_tertiary)
+                                                            .child(SharedString::from(format!(
+                                                                "  {secondary}"
+                                                            ))),
+                                                    )
+                                                }),
                                         )
+                                        .when(shared, |element| {
+                                            element.child(
+                                                div()
+                                                    .flex_none()
+                                                    .text_size(px(10.0))
+                                                    .font_weight(FontWeight::MEDIUM)
+                                                    .text_color(shared_color)
+                                                    .child(tr!("branches.shared_label")),
+                                            )
+                                        })
                                         .when(selected, |element| {
                                             element.child(icon(
                                                 "icons/check.svg",
@@ -3021,16 +3142,13 @@ impl Waku {
                                     if disabled {
                                         row.into_any_element()
                                     } else {
-                                        let branch_name = branch.name.clone();
+                                        let selection = entry.clone();
                                         let select_weak = list_weak.clone();
                                         let select_popover = list_popover.clone();
                                         row.on_click(move |_, window, cx| {
                                             let should_close = select_weak
                                                 .update(cx, |this, cx| {
-                                                    this.choose_workspace_branch(
-                                                        branch_name.clone(),
-                                                        cx,
-                                                    )
+                                                    this.choose_workspace_ref(selection.clone(), cx)
                                                 })
                                                 .unwrap_or(false);
                                             if should_close {
@@ -3203,9 +3321,22 @@ impl Waku {
     }
 }
 
-/// Branches matching the search, with the selected branch pinned first and
-/// every other row sorted by name. Disabled worktree-owned rows stay in the
-/// result; the UI needs to explain why Git cannot switch to them.
+fn workspace_ref_is_selected(
+    entry: &crate::git_branch::WorkspaceRef,
+    workspace: &SessionWorkspace,
+    selected_branch: &str,
+) -> bool {
+    match entry {
+        crate::git_branch::WorkspaceRef::Branch { name, .. } => name == selected_branch,
+        crate::git_branch::WorkspaceRef::Shared(worktree) => {
+            workspace.path().is_some_and(|path| path == worktree.path)
+        }
+    }
+}
+
+/// Legacy local-branch filtering retained for the branch-picker behavior test;
+/// the production picker uses [`crate::git_branch::workspace_ref_entries`].
+#[cfg(test)]
 pub(super) fn visible_branch_entries(
     branches: &[crate::git_branch::BranchEntry],
     selected_branch: &str,

@@ -1,3 +1,4 @@
+use super::branches::{WorkspaceSelectionPlan, plan_workspace_selection};
 use super::composer::{
     ComposerSubmitAction, composer_submit_action, dropped_file_mention, merged_submission,
     next_picker_highlight, visible_branch_entries,
@@ -24,7 +25,7 @@ use crate::git_branch::BranchEntry;
 use crate::model::{
     ActivityItem, ActivityKind, AgentSession, Checkpoint, CheckpointFile, CheckpointStatus,
     DriverEvent, Message, MessageRole, ProviderKind, ReasoningBlock, SessionStatus,
-    TranscriptBlock, TurnStatus,
+    SessionWorkspace, TranscriptBlock, TurnStatus,
 };
 use gpui::{ListAlignment, ListState, Pixels, px};
 use std::{
@@ -221,6 +222,38 @@ fn branch_picker_pins_selection_and_filters_by_name() {
             .map(|branch| branch.name.as_str())
             .collect::<Vec<_>>(),
         vec!["topic/apple"]
+    );
+}
+
+#[test]
+fn workspace_selection_plans_preserve_shared_paths_and_existing_modes() {
+    let shared_worktree = crate::git_branch::SharedWorktree {
+        path: std::path::PathBuf::from("/tmp/shared"),
+        name: "shared".into(),
+        head: crate::git_branch::WorktreeHead::Detached {
+            commit: "0123456789abcdef".into(),
+        },
+    };
+    let shared = crate::git_branch::WorkspaceRef::Shared(shared_worktree.clone());
+    assert_eq!(
+        plan_workspace_selection(&SessionWorkspace::Local, &shared),
+        WorkspaceSelectionPlan::BindShared(shared_worktree)
+    );
+
+    let branch = crate::git_branch::WorkspaceRef::Branch {
+        name: "release/next".into(),
+        checked_out_elsewhere: false,
+    };
+    assert_eq!(
+        plan_workspace_selection(
+            &SessionWorkspace::NewWorktree { base_branch: None },
+            &branch,
+        ),
+        WorkspaceSelectionPlan::SetNewWorktreeBase("release/next".into())
+    );
+    assert_eq!(
+        plan_workspace_selection(&SessionWorkspace::Local, &branch),
+        WorkspaceSelectionPlan::CheckoutInCurrent("release/next".into())
     );
 }
 

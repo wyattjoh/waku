@@ -32,11 +32,17 @@ fn prepare_submission(
             )?;
             SessionWorkspace::Worktree {
                 path: created.path,
-                branch: created.branch,
+                branch: Some(created.branch),
+                detached_head: None,
             }
         }
         workspace => workspace,
     };
+    if let SessionWorkspace::Worktree { path, .. } = &workspace
+        && !path.is_dir()
+    {
+        anyhow::bail!(tr!("errors.workspace_unavailable"));
+    }
     let project_path = workspace.path().unwrap_or(&project.path);
 
     // Every turn gets its own immutable starting snapshot. Reusing the prior
@@ -2422,7 +2428,12 @@ impl Waku {
                     }
                     self.splice_transcript_rows_after_visibility_change(&previous_kinds);
                     self.restore_composer_submission(submission, cx);
-                    self.show_toast(tr!("errors.create_worktree", error = error));
+                    let error = if error.to_string() == tr!("errors.workspace_unavailable") {
+                        tr!("errors.workspace_unavailable")
+                    } else {
+                        tr!("errors.create_worktree", error = error)
+                    };
+                    self.show_toast(error);
                 }
                 cx.notify();
                 return;
