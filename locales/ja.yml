@@ -431,14 +431,13 @@ branches.create_hint: Return キーで作成 · Esc キーでキャンセル
 branches.none_found: ブランチが見つかりません
 branches.create_and_checkout_ellipsis: 新しいブランチを作成してチェックアウト…
 branches.title: ブランチ
-branches.shared_label: shared
+branches.worktree_label: ワークツリー
 
 workspace.work_in: 作業場所
 workspace.local: ローカル
 workspace.new_worktree: 新しいワークツリー
-workspace.shared_worktree: 共有ワークツリー
-workspace.shared_worktree_branch: "共有ワークツリー（%{branch}）"
-workspace.shared_worktree_detached: "共有ワークツリー（%{commit}）"
+workspace.worktree_branch: "ワークツリー（%{branch}）"
+workspace.worktree_detached: "ワークツリー（%{commit}）"
 workspace.unavailable: ワークスペースを利用できません
 workspace.workspace: ワークスペース
 workspace.worktree: ワークツリー
@@ -487,7 +486,7 @@ errors.project_not_found: プロジェクトが見つかりません
 errors.prepare_task_project_not_found: タスクを準備できませんでした：プロジェクトが見つかりません
 errors.store_pasted_image: "ペーストした画像を添付できませんでした：%{error}"
 errors.create_worktree: "ワークツリーを作成できませんでした：%{error}"
-errors.stale_worktree_selection: 共有ワークツリーは利用できなくなりました。ピッカーを更新しました。
+errors.stale_worktree_selection: ワークツリーは利用できなくなりました。ピッカーを更新しました。
 errors.workspace_unavailable: ワークスペースを利用できません
 errors.prepared_runtime_unavailable: 準備したエージェントランタイムは利用できません
 errors.start_agent: "エージェントを起動できませんでした：%{error}"

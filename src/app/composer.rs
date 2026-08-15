@@ -1031,9 +1031,7 @@ impl Waku {
                 SessionWorkspace::NewWorktree { .. } => {
                     SharedString::from(tr!("workspace.new_worktree"))
                 }
-                SessionWorkspace::Worktree { .. } => {
-                    SharedString::from(tr!("workspace.shared_worktree"))
-                }
+                SessionWorkspace::Worktree { .. } => SharedString::from(tr!("workspace.worktree")),
             }
         };
         let workspace_icon = if workspace.is_local() {
@@ -1054,19 +1052,19 @@ impl Waku {
         }
 
         let local_selected = workspace.is_local();
-        let worktree_selected = matches!(workspace, SessionWorkspace::NewWorktree { .. });
-        let shared_selected = matches!(target, AgentControlTarget::Session)
+        let new_worktree_selected = matches!(workspace, SessionWorkspace::NewWorktree { .. });
+        let existing_worktree_selected = matches!(target, AgentControlTarget::Session)
             && matches!(workspace, SessionWorkspace::Worktree { .. });
-        let shared_label = match &workspace {
+        let worktree_label = match &workspace {
             SessionWorkspace::Worktree {
                 branch: Some(branch),
                 ..
-            } => tr!("workspace.shared_worktree_branch", branch = branch.clone()),
+            } => tr!("workspace.worktree_branch", branch = branch.clone()),
             SessionWorkspace::Worktree {
                 detached_head: Some(commit),
                 ..
             } => tr!(
-                "workspace.shared_worktree_detached",
+                "workspace.worktree_detached",
                 commit = crate::git_branch::short_commit(commit)
             ),
             SessionWorkspace::Worktree { path, .. } => {
@@ -1075,7 +1073,7 @@ impl Waku {
                     .and_then(|name| name.to_str())
                     .map(str::to_owned)
                     .unwrap_or_else(|| tr!("workspace.workspace"));
-                tr!("workspace.shared_worktree_detached", commit = name)
+                tr!("workspace.worktree_detached", commit = name)
             }
             SessionWorkspace::Local | SessionWorkspace::NewWorktree { .. } => String::new(),
         };
@@ -1089,9 +1087,9 @@ impl Waku {
                 let local = weak.clone();
                 let worktree = weak.clone();
                 let mut items = vec![MenuItem::Header(tr!("workspace.work_in").into())];
-                if shared_selected {
+                if existing_worktree_selected {
                     items.push(
-                        MenuItem::new(shared_label.clone(), |_, _| {})
+                        MenuItem::new(worktree_label.clone(), |_, _| {})
                             .icon("icons/fork.svg")
                             .selected(true)
                             .disabled(true),
@@ -1111,7 +1109,7 @@ impl Waku {
                         });
                     })
                     .icon("icons/fork.svg")
-                    .selected(worktree_selected)
+                    .selected(new_worktree_selected)
                     .disabled(no_project_selected),
                 ]);
                 items
@@ -3062,8 +3060,8 @@ impl Waku {
                                     } else {
                                         theme.text
                                     };
-                                    let shared = entry.is_shared();
-                                    let shared_color = theme.gauge;
+                                    let is_worktree = entry.is_worktree();
+                                    let worktree_color = theme.gauge;
                                     let primary = entry.display_name().to_owned();
                                     let secondary = entry.secondary_text();
                                     let entry_id =
@@ -3087,7 +3085,7 @@ impl Waku {
                                                 .active(|element| element.opacity(0.85))
                                         })
                                         .child(icon(
-                                            if shared {
+                                            if is_worktree {
                                                 "icons/fork.svg"
                                             } else {
                                                 "icons/git-branch.svg"
@@ -3122,14 +3120,14 @@ impl Waku {
                                                     )
                                                 }),
                                         )
-                                        .when(shared, |element| {
+                                        .when(is_worktree, |element| {
                                             element.child(
                                                 div()
                                                     .flex_none()
                                                     .text_size(px(10.0))
                                                     .font_weight(FontWeight::MEDIUM)
-                                                    .text_color(shared_color)
-                                                    .child(tr!("branches.shared_label")),
+                                                    .text_color(worktree_color)
+                                                    .child(tr!("branches.worktree_label")),
                                             )
                                         })
                                         .when(selected, |element| {
@@ -3328,7 +3326,7 @@ fn workspace_ref_is_selected(
 ) -> bool {
     match entry {
         crate::git_branch::WorkspaceRef::Branch { name, .. } => name == selected_branch,
-        crate::git_branch::WorkspaceRef::Shared(worktree) => {
+        crate::git_branch::WorkspaceRef::Worktree(worktree) => {
             workspace.path().is_some_and(|path| path == worktree.path)
         }
     }

@@ -70,7 +70,7 @@ pub struct WorktreeEntry {
 pub struct WorktreeSnapshot {
     pub repository: PathBuf,
     /// The canonical project path in the active checkout. It is always
-    /// excluded from shared rows, even when the caller originally stored a
+    /// excluded from existing-worktree rows, even when the caller originally stored a
     /// symlinked or non-canonical project path.
     pub project_path: PathBuf,
     /// The project path relative to the repository root. An empty path means
@@ -84,7 +84,7 @@ impl WorktreeSnapshot {
         worktree.root.join(&self.project_relative)
     }
 
-    pub fn shared_worktrees(&self, excluded_paths: &[&Path]) -> Vec<SharedWorktree> {
+    pub fn existing_worktrees(&self, excluded_paths: &[&Path]) -> Vec<ExistingWorktree> {
         self.worktrees
             .iter()
             .filter_map(|worktree| {
@@ -94,7 +94,7 @@ impl WorktreeSnapshot {
                 {
                     return None;
                 }
-                Some(SharedWorktree {
+                Some(ExistingWorktree {
                     path,
                     name: worktree_name(&worktree.root),
                     head: worktree.head.clone(),
@@ -105,7 +105,7 @@ impl WorktreeSnapshot {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SharedWorktree {
+pub struct ExistingWorktree {
     /// The project-relative path a task should use, not just the repository
     /// root. This is what gets persisted in the session workspace.
     pub path: PathBuf,
@@ -120,36 +120,36 @@ pub enum WorkspaceRef {
         name: String,
         checked_out_elsewhere: bool,
     },
-    Shared(SharedWorktree),
+    Worktree(ExistingWorktree),
 }
 
 impl WorkspaceRef {
     pub fn branch_name(&self) -> Option<&str> {
         match self {
             Self::Branch { name, .. } => Some(name),
-            Self::Shared(worktree) => worktree.head.branch(),
+            Self::Worktree(worktree) => worktree.head.branch(),
         }
     }
 
     pub fn display_name(&self) -> &str {
         match self {
             Self::Branch { name, .. } => name,
-            Self::Shared(worktree) => worktree.head.branch().unwrap_or(worktree.name.as_str()),
+            Self::Worktree(worktree) => worktree.head.branch().unwrap_or(worktree.name.as_str()),
         }
     }
 
     pub fn secondary_text(&self) -> Option<String> {
         match self {
             Self::Branch { .. } => None,
-            Self::Shared(worktree) => worktree
+            Self::Worktree(worktree) => worktree
                 .head
                 .display_commit()
                 .map(|commit| format!("detached at {commit}")),
         }
     }
 
-    pub fn is_shared(&self) -> bool {
-        matches!(self, Self::Shared(_))
+    pub fn is_worktree(&self) -> bool {
+        matches!(self, Self::Worktree(_))
     }
 
     pub fn is_disabled(&self) -> bool {
@@ -172,7 +172,7 @@ impl WorkspaceRef {
     fn search_text(&self) -> String {
         match self {
             Self::Branch { name, .. } => name.to_ascii_lowercase(),
-            Self::Shared(worktree) => {
+            Self::Worktree(worktree) => {
                 let mut text = format!(
                     "{} {}",
                     worktree.name.to_ascii_lowercase(),
@@ -374,13 +374,13 @@ pub fn discover_worktrees(project_path: &Path) -> anyhow::Result<Option<Worktree
     }))
 }
 
-/// Re-read worktrees immediately before a shared selection is applied. The
+/// Re-read worktrees immediately before an existing-worktree selection is applied. The
 /// returned metadata is fresh, so a branch that moved to detached HEAD does
 /// not leave stale display data in the draft.
-pub fn validate_shared_worktree(
+pub fn validate_existing_worktree(
     project_path: &Path,
     selected_path: &Path,
-) -> anyhow::Result<Option<SharedWorktree>> {
+) -> anyhow::Result<Option<ExistingWorktree>> {
     let Some(snapshot) = discover_worktrees(project_path)? else {
         return Ok(None);
     };
@@ -390,7 +390,7 @@ pub fn validate_shared_worktree(
         .iter()
         .find(|worktree| snapshot.project_path(worktree) == selected_path)
         .filter(|worktree| snapshot.project_path(worktree).is_dir())
-        .map(|worktree| SharedWorktree {
+        .map(|worktree| ExistingWorktree {
             path: snapshot.project_path(worktree),
             name: worktree_name(&worktree.root),
             head: worktree.head.clone(),
@@ -463,10 +463,10 @@ pub fn workspace_ref_entries(
     excluded_worktree_paths: &[&Path],
     normalized_query: &str,
 ) -> Vec<WorkspaceRef> {
-    let shared = worktrees
-        .map(|worktrees| worktrees.shared_worktrees(excluded_worktree_paths))
+    let existing = worktrees
+        .map(|worktrees| worktrees.existing_worktrees(excluded_worktree_paths))
         .unwrap_or_default();
-    let shared_by_branch = shared
+    let worktree_by_branch = existing
         .iter()
         .filter_map(|worktree| {
             worktree
@@ -475,7 +475,7 @@ pub fn workspace_ref_entries(
                 .map(|branch| (branch, worktree.clone()))
         })
         .collect::<HashMap<_, _>>();
-    let shared_branch_names = shared_by_branch
+    let worktree_branch_names = worktree_by_branch
         .keys()
         .map(|branch| (*branch).to_owned())
         .collect::<HashSet<_>>();
@@ -487,7 +487,7 @@ pub fn workspace_ref_entries(
     let mut refs = Vec::new();
 
     if let Some(current) = current {
-        refs.push(pinned_ref(current, &shared_by_branch));
+        refs.push(pinned_ref(current, &worktree_by_branch));
     } else if let Some(detached_head) = snapshot.detached_head.as_deref() {
         refs.push(WorkspaceRef::Branch {
             name: short_commit(detached_head),
@@ -495,7 +495,7 @@ pub fn workspace_ref_entries(
         });
     }
     if let Some(default) = default {
-        refs.push(pinned_ref(default, &shared_by_branch));
+        refs.push(pinned_ref(default, &worktree_by_branch));
     }
 
     let pinned_names = refs
@@ -503,7 +503,7 @@ pub fn workspace_ref_entries(
         .filter_map(WorkspaceRef::branch_name)
         .map(str::to_owned)
         .collect::<HashSet<_>>();
-    let mut shared_refs = shared
+    let mut worktree_refs = existing
         .into_iter()
         .filter(|worktree| {
             worktree
@@ -511,21 +511,21 @@ pub fn workspace_ref_entries(
                 .branch()
                 .is_none_or(|branch| !pinned_names.contains(branch))
         })
-        .map(WorkspaceRef::Shared)
+        .map(WorkspaceRef::Worktree)
         .collect::<Vec<_>>();
-    shared_refs.sort_by(|left, right| {
+    worktree_refs.sort_by(|left, right| {
         left.display_name()
             .cmp(right.display_name())
             .then_with(|| left.secondary_text().cmp(&right.secondary_text()))
     });
-    refs.extend(shared_refs);
+    refs.extend(worktree_refs);
 
     let mut local = snapshot
         .branches
         .iter()
         .filter(|branch| worktrees.is_none() || !branch.checked_out_elsewhere)
         .filter(|branch| !pinned_names.contains(branch.name.as_str()))
-        .filter(|branch| !shared_branch_names.contains(branch.name.as_str()))
+        .filter(|branch| !worktree_branch_names.contains(branch.name.as_str()))
         .map(|branch| WorkspaceRef::Branch {
             name: branch.name.clone(),
             checked_out_elsewhere: branch.checked_out_elsewhere,
@@ -550,10 +550,10 @@ pub fn workspace_ref_entries(
         .collect()
 }
 
-fn pinned_ref(branch: &str, shared_by_branch: &HashMap<&str, SharedWorktree>) -> WorkspaceRef {
-    shared_by_branch
+fn pinned_ref(branch: &str, worktree_by_branch: &HashMap<&str, ExistingWorktree>) -> WorkspaceRef {
+    worktree_by_branch
         .get(branch)
-        .map(|worktree| WorkspaceRef::Shared(worktree.clone()))
+        .map(|worktree| WorkspaceRef::Worktree(worktree.clone()))
         .unwrap_or_else(|| WorkspaceRef::Branch {
             name: branch.to_owned(),
             checked_out_elsewhere: false,
@@ -1063,7 +1063,7 @@ mod tests {
         assert!(refs.iter().any(|entry| {
             matches!(
                 entry,
-                WorkspaceRef::Shared(worktree)
+                WorkspaceRef::Worktree(worktree)
                     if worktree.name == "apple"
                         && worktree.head.commit() == Some("deadbeef1234567890abcdef1234567890abcdef")
             )
@@ -1075,6 +1075,6 @@ mod tests {
             "deadbeef",
         );
         assert_eq!(by_commit.len(), 1);
-        assert!(by_commit[0].is_shared());
+        assert!(by_commit[0].is_worktree());
     }
 }

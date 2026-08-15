@@ -226,18 +226,18 @@ fn branch_picker_pins_selection_and_filters_by_name() {
 }
 
 #[test]
-fn workspace_selection_plans_preserve_shared_paths_and_existing_modes() {
-    let shared_worktree = crate::git_branch::SharedWorktree {
-        path: std::path::PathBuf::from("/tmp/shared"),
-        name: "shared".into(),
+fn workspace_selection_plans_preserve_existing_worktree_paths_and_modes() {
+    let existing_worktree = crate::git_branch::ExistingWorktree {
+        path: std::path::PathBuf::from("/tmp/existing-worktree"),
+        name: "existing-worktree".into(),
         head: crate::git_branch::WorktreeHead::Detached {
             commit: "0123456789abcdef".into(),
         },
     };
-    let shared = crate::git_branch::WorkspaceRef::Shared(shared_worktree.clone());
+    let worktree = crate::git_branch::WorkspaceRef::Worktree(existing_worktree.clone());
     assert_eq!(
-        plan_workspace_selection(&SessionWorkspace::Local, &shared),
-        WorkspaceSelectionPlan::BindShared(shared_worktree)
+        plan_workspace_selection(&SessionWorkspace::Local, &worktree),
+        WorkspaceSelectionPlan::BindWorktree(existing_worktree)
     );
 
     let branch = crate::git_branch::WorkspaceRef::Branch {

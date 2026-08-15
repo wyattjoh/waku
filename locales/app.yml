@@ -1013,8 +1013,8 @@ branches.create_and_checkout_ellipsis:
   en: Create and checkout new branch…
 branches.title:
   en: Branches
-branches.shared_label:
-  en: shared
+branches.worktree_label:
+  en: worktree
 
 workspace.work_in:
   en: Work in
@@ -1022,18 +1022,16 @@ workspace.local:
   en: Local
 workspace.new_worktree:
   en: New worktree
-workspace.shared_worktree:
-  en: Shared worktree
-workspace.shared_worktree_branch:
-  en: "Shared worktree (%{branch})"
-workspace.shared_worktree_detached:
-  en: "Shared worktree (%{commit})"
 workspace.unavailable:
   en: Workspace unavailable
 workspace.workspace:
   en: workspace
 workspace.worktree:
   en: Worktree
+workspace.worktree_branch:
+  en: "Worktree (%{branch})"
+workspace.worktree_detached:
+  en: "Worktree (%{commit})"
 
 terminal.starting:
   en: Starting terminal…
@@ -1121,7 +1119,7 @@ errors.store_pasted_image:
 errors.create_worktree:
   en: "Could not create the worktree: %{error}"
 errors.stale_worktree_selection:
-  en: That shared worktree is no longer available. The picker was refreshed.
+  en: That worktree is no longer available. The picker was refreshed.
 errors.workspace_unavailable:
   en: Workspace unavailable
 errors.prepared_runtime_unavailable:

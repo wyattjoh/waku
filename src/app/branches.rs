@@ -7,7 +7,7 @@ enum BranchOperation {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum WorkspaceSelectionPlan {
-    BindShared(crate::git_branch::SharedWorktree),
+    BindWorktree(crate::git_branch::ExistingWorktree),
     SetNewWorktreeBase(String),
     CheckoutInCurrent(String),
 }
@@ -17,7 +17,7 @@ pub(super) fn plan_workspace_selection(
     selection: &WorkspaceRef,
 ) -> WorkspaceSelectionPlan {
     match selection {
-        WorkspaceRef::Shared(worktree) => WorkspaceSelectionPlan::BindShared(worktree.clone()),
+        WorkspaceRef::Worktree(worktree) => WorkspaceSelectionPlan::BindWorktree(worktree.clone()),
         WorkspaceRef::Branch { name, .. } => {
             if matches!(workspace, SessionWorkspace::NewWorktree { .. }) {
                 WorkspaceSelectionPlan::SetNewWorktreeBase(name.clone())
@@ -236,14 +236,14 @@ impl Waku {
         }
         let plan = plan_workspace_selection(&session.workspace, &selection);
         match plan {
-            WorkspaceSelectionPlan::BindShared(shared) => {
+            WorkspaceSelectionPlan::BindWorktree(worktree) => {
                 let Some(project_path) =
                     self.selected_project().map(|project| project.path.clone())
                 else {
                     return false;
                 };
                 let validated =
-                    crate::git_branch::validate_shared_worktree(&project_path, &shared.path)
+                    crate::git_branch::validate_existing_worktree(&project_path, &worktree.path)
                         .ok()
                         .flatten();
                 let Some(validated) = validated else {
