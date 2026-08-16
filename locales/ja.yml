@@ -636,6 +636,9 @@ errors.project_not_found: プロジェクトが見つかりません
 errors.prepare_task_project_not_found: タスクを準備できませんでした：プロジェクトが見つかりません
 errors.store_pasted_image: "ペーストした画像を添付できませんでした：%{error}"
 errors.create_worktree: "ワークツリーを作成できませんでした：%{error}"
+errors.prepare_automation_run: "自動化の実行を準備できませんでした：%{error}"
+errors.prepare_task: "タスクを準備できませんでした：%{error}"
+errors.run_automation: "自動化を開始できませんでした：%{error}"
 errors.prepared_runtime_unavailable: 準備したエージェントランタイムは利用できません
 errors.start_agent: "エージェントを起動できませんでした：%{error}"
 errors.provider_no_active_turn: "%{provider} には指示を追加できる実行中のターンがありません"
@@ -1037,3 +1040,132 @@ usage_error.curl_did_not_finish: curl がリクエストを完了しませんで
 usage_error.curl_failed: "curl に失敗しました：%{error}"
 usage_error.unknown_error: 不明なエラー
 usage_error.curl_no_status: curl から HTTP ステータス行が返されませんでした
+
+sidebar.automations: 自動化
+sidebar.automation_deleted: 自動化
+sidebar.show_more_runs: "他 %{count} 件を表示"
+sidebar.show_fewer_runs: 折りたたむ
+
+command_palette.automations: 自動化
+command_palette.new_automation: 新規自動化…
+command_palette.automation_run: "自動化：%{name}"
+
+automations.title: 自動化
+automations.new: 新規自動化
+automations.create_title: 新規自動化
+automations.edit_title: 自動化を編集
+automations.default_name: 新規自動化
+automations.empty_title: 自動化がまだありません
+automations.empty_body: 保存したプロンプトを毎日・毎週・毎月のスケジュールで実行する自動化を作成します。
+automations.field_name: 名前
+automations.field_name_description: サイドバー・通知・コマンドパレットに表示されます。
+automations.field_instructions: 指示
+automations.field_instructions_description: 実行のたびにエージェントへ依頼する内容です。
+automations.field_project: プロジェクト
+automations.field_provider: プロバイダー
+automations.field_model: モデル
+automations.field_effort: 推論の強度
+automations.field_permission: 権限
+automations.field_schedule_frequency: 頻度
+automations.field_schedule_frequency_description: 実行を開始する間隔です。
+automations.field_time: 時刻
+automations.field_time_description: 各実行を開始する現地時刻です。
+automations.field_minute_description: 毎時、何分に実行を開始するかです。
+automations.field_days: 実行日
+automations.field_weekdays_description: 実行を開始する曜日です。
+automations.field_monthdays_description: 実行を開始する日付です。その日がない月はスキップされます。
+automations.field_overlap: 実行中の場合
+automations.field_overlap_description: 前回の実行がまだ続いているときの動作です。
+automations.field_notifications: 通知
+automations.field_notifications_description: 実行が終了したときにシステム通知を表示します。
+automations.field_notify_when: 通知するタイミング
+automations.field_notify_when_description: どの結果を通知するかです。
+automations.field_enabled_description: 無効にするとスケジュールは残りますが実行されません。
+automations.name_placeholder: 自動化の名前
+automations.prompt_placeholder: この自動化で何をしますか？
+automations.hour_placeholder: 時
+automations.minute_placeholder: 分
+automations.at_minute: ":"
+automations.model_default: プロバイダーのデフォルト
+automations.effort_default: デフォルト
+automations.no_project: プロジェクトなし
+automations.workspace_worktree: 実行ごとに新しいワークツリー
+automations.frequency_daily: 毎日
+automations.frequency_weekly: 毎週
+automations.frequency_monthly: 毎月
+automations.preset_manual: 手動
+automations.preset_hourly: 毎時
+automations.preset_weekdays: 平日
+automations.hint_manual: 手動で開始したときのみ実行されます
+automations.weekday_mon: 月
+automations.weekday_tue: 火
+automations.weekday_wed: 水
+automations.weekday_thu: 木
+automations.weekday_fri: 金
+automations.weekday_sat: 土
+automations.weekday_sun: 日
+automations.overlap_skip: この実行をスキップ
+automations.overlap_queue: 空くまで待機
+automations.overlap_concurrent: そのまま実行
+automations.notify_always: 常に
+automations.notify_success: 成功時
+automations.notify_failure: 失敗時
+automations.notify_succeeded: 自動化の実行が完了しました
+automations.notify_failed: 自動化の実行が失敗しました
+automations.enabled: 有効
+automations.disabled: 無効
+automations.menu_enable: 有効化
+automations.menu_disable: 無効化
+automations.edit: 編集
+automations.delete: 削除
+automations.confirm_delete: 削除を確認
+automations.delete_title: 「%{name}」を削除しますか？
+automations.delete_runs: この自動化には %{count} 件の実行があります。
+automations.delete_sessions: この自動化の %{count} 件のセッションとそのトランスクリプトも削除する。
+automations.delete_irreversible: この操作は取り消せません。
+automations.delete_sessions_partial: 応答のフォークが進行中のため、%{count} 件のセッションを削除できませんでした。
+automations.run_now: 今すぐ実行
+automations.save: 保存
+automations.create: 作成
+automations.save_failed_missing: この自動化は別の場所で削除されました。変更を保持するには作成し直してください。
+automations.prompt_missing: 指示を入力してください。指示がないとスケジュール実行は開始されません。
+automations.cancel: キャンセル
+automations.next_run: "次回の実行 %{time}"
+automations.next_run_none: スケジュールなし
+automations.summary_daily: "毎日 %{time}"
+automations.summary_weekly: "毎週 %{days} %{time}"
+automations.summary_monthly: "毎月 %{days} 日 %{time}"
+automations.summary_hourly: "毎時 :%{minute}"
+automations.summary_manual: 手動 — スケジュールなし
+automations.prompt_required: 保存する前にプロンプトを入力してください。
+automations.name_required: 保存する前に名前を入力してください。
+automations.web_description: スケジュール、実行結果、トランスクリプトを確認できます。
+automations.authoring_description: プロンプト、エージェント、スケジュール、重複、通知を設定します。
+automations.daemon_required: スケジュール実行には Waku クライアントが起動している必要があります。
+automations.client_connected: Waku クライアントに接続済み
+automations.client_disconnected: Waku クライアントに未接続
+automations.empty_read_body: Waku で作成した自動化とその実行履歴がここに表示されます。
+automations.history: 実行履歴
+automations.no_runs: 実行履歴はまだありません。
+automations.select_hint: 自動化を選択するとスケジュールと実行履歴を確認できます。
+automations.run_started: 自動化を開始しました
+automations.saved: 自動化を保存しました
+automations.deleted: 自動化を削除しました
+automations.run_transcript: 実行トランスクリプト
+automations.loading_transcript: トランスクリプトを読み込み中…
+automations.transcript_unavailable: この実行のトランスクリプトは利用できません。
+automations.open_task: タスクを開く
+automations.catch_up: キャッチアップ
+automations.notifications_off: オフ
+automations.model_description: 空欄にするとプロバイダーのデフォルトを使用します。
+automations.field_service_tier: サービスティア
+automations.field_agent_preset: エージェントプリセット
+automations.field_interaction: 対話モード
+automations.delete_safe_description: 自動化だけを削除し、セッションとトランスクリプトは残します。
+automations.delete_sessions_exact: セッション %{count} 件とそのトランスクリプトも削除します。
+automations.frequency_hourly: 毎時
+automations.outcome_running: 実行中
+automations.outcome_succeeded: 成功
+automations.outcome_failed: 失敗
+automations.outcome_cancelled: キャンセル
+automations.outcome_skipped: スキップ

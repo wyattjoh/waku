@@ -1,5 +1,34 @@
 use super::*;
 
+fn cancel_automation_run_for_removed_session(state: &mut PersistedState, session_id: Uuid) -> bool {
+    let Some(automation_id) = state
+        .sessions
+        .iter()
+        .find(|session| session.id == session_id)
+        .and_then(|session| session.originating_automation)
+    else {
+        return false;
+    };
+    state
+        .automation_mut(automation_id)
+        .is_some_and(|automation| {
+            automation.settle_session_run(session_id, crate::automation::RunOutcome::Cancelled)
+        })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SessionRemovalResult {
+    Removed,
+    Missing,
+    ResponseForkInProgress,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SessionRemovalFeedback {
+    ShowResponseForkToast,
+    SuppressResponseForkToast,
+}
+
 fn retain_runtime_after_cancel(provider: ProviderKind) -> bool {
     // Codex's app-server owns the Computer Use process tree, and Amp offers no
     // interrupt on its stream — stopping it means ending the process. Both
@@ -160,6 +189,9 @@ impl Waku {
     }
 
     fn activate_session(&mut self, session_id: Uuid, cx: &mut Context<Self>) {
+        // Showing a session leaves the Automations page (unlike Settings, its
+        // sidebar stays visible, so a session row can be clicked from it).
+        self.set_active_page(None, cx);
         let session_changed = self.state.selected_session != Some(session_id);
         if session_changed {
             self.capture_and_save_current_composer_draft(cx);
@@ -269,11 +301,45 @@ impl Waku {
         cx.notify();
     }
 
-    pub(super) fn remove_session(&mut self, session_id: Uuid, cx: &mut Context<Self>) {
+    pub(super) fn remove_session(
+        &mut self,
+        session_id: Uuid,
+        cx: &mut Context<Self>,
+    ) -> SessionRemovalResult {
+        self.remove_session_with_feedback(
+            session_id,
+            cx,
+            SessionRemovalFeedback::ShowResponseForkToast,
+        )
+    }
+
+    /// The automation cascade uses the same teardown path while deferring the
+    /// response-fork refusal to one aggregate report after all sessions are
+    /// attempted.
+    pub(super) fn remove_session_for_automation_cascade(
+        &mut self,
+        session_id: Uuid,
+        cx: &mut Context<Self>,
+    ) -> SessionRemovalResult {
+        self.remove_session_with_feedback(
+            session_id,
+            cx,
+            SessionRemovalFeedback::SuppressResponseForkToast,
+        )
+    }
+
+    fn remove_session_with_feedback(
+        &mut self,
+        session_id: Uuid,
+        cx: &mut Context<Self>,
+        feedback: SessionRemovalFeedback,
+    ) -> SessionRemovalResult {
         if self.response_fork_preparations.contains_key(&session_id) {
-            self.show_toast(tr!("session.response_fork_in_progress"));
-            cx.notify();
-            return;
+            if feedback == SessionRemovalFeedback::ShowResponseForkToast {
+                self.show_toast(tr!("session.response_fork_in_progress"));
+                cx.notify();
+            }
+            return SessionRemovalResult::ResponseForkInProgress;
         }
         let Some(index) = self
             .state
@@ -281,7 +347,7 @@ impl Waku {
             .iter()
             .position(|session| session.id == session_id)
         else {
-            return;
+            return SessionRemovalResult::Missing;
         };
         let project_id = self.state.sessions[index].project_id;
         let composer_draft_key =
@@ -296,6 +362,7 @@ impl Waku {
             .workspace_path_for_session(&self.state.sessions[index])
             .map(std::path::Path::to_path_buf);
         let was_selected = self.state.selected_session == Some(session_id);
+        cancel_automation_run_for_removed_session(&mut self.state, session_id);
         self.submission_preparations.remove(&session_id);
         self.reset_session_runtime(session_id);
         self.background_work.remove(&session_id);
@@ -370,6 +437,7 @@ impl Waku {
         cx.background_executor()
             .spawn(async move { sweep() })
             .detach();
+        SessionRemovalResult::Removed
     }
 
     pub(super) fn new_session_action(
@@ -378,7 +446,7 @@ impl Waku {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.settings_page = None;
+        self.set_active_page(None, cx);
         if let Some(session_id) = self
             .session_navigation
             .remembered_new_task(&self.state.sessions)
@@ -410,7 +478,7 @@ impl Waku {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.settings_page = Some(SettingsPage::General);
+        self.set_active_page(Some(ActivePage::Settings(SettingsPage::General)), cx);
         self.settings_scroll.set_offset(gpui::Point::default());
         // Sparkle owns this value and its consent prompt can flip it outside
         // the settings UI, so re-mirror it each time settings opens.
@@ -630,7 +698,8 @@ impl Waku {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.settings_page.take().is_some() {
+        if matches!(self.active_page.as_ref(), Some(ActivePage::Settings(_))) {
+            self.set_active_page(None, cx);
             let focus_handle = self.composer_focus(cx);
             window.focus(&focus_handle, cx);
             cx.notify();
@@ -641,7 +710,7 @@ impl Waku {
             return;
         };
         if let Some(target) = self.session_navigation.back_target() {
-            self.settings_page = None;
+            self.set_active_page(None, cx);
             self.request_session_activation(
                 target,
                 SessionActivationTransition::Back { from: current },
@@ -656,7 +725,7 @@ impl Waku {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.settings_page.is_some() {
+        if matches!(self.active_page.as_ref(), Some(ActivePage::Settings(_))) {
             return;
         }
 
@@ -664,7 +733,7 @@ impl Waku {
             return;
         };
         if let Some(target) = self.session_navigation.forward_target() {
-            self.settings_page = None;
+            self.set_active_page(None, cx);
             self.request_session_activation(
                 target,
                 SessionActivationTransition::Forward { from: current },
@@ -698,7 +767,7 @@ impl Waku {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.settings_page = None;
+        self.set_active_page(None, cx);
         let focus_handle = self.composer_focus(cx);
         window.focus(&focus_handle, cx);
         cx.notify();
@@ -710,7 +779,26 @@ impl Waku {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.settings_page.take().is_some() {
+        // Escape backs the editor out to the list, then closes the page. Route
+        // through `set_active_page` rather than taking the page apart here, so
+        // the editor is committed before its value is dropped.
+        if matches!(
+            self.active_page,
+            Some(ActivePage::Automations(
+                automations_page::AutomationsPage::Editor(_)
+            ))
+        ) {
+            self.set_active_page(
+                Some(ActivePage::Automations(
+                    automations_page::AutomationsPage::List,
+                )),
+                cx,
+            );
+            window.focus(&self.automations_focus, cx);
+            cx.notify();
+            return;
+        }
+        if self.active_page.take().is_some() {
             let focus_handle = self.composer_focus(cx);
             window.focus(&focus_handle, cx);
             cx.notify();
@@ -904,7 +992,7 @@ impl Waku {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.settings_page.is_some() {
+        if matches!(self.active_page.as_ref(), Some(ActivePage::Settings(_))) {
             return;
         }
         if !self
@@ -1154,6 +1242,7 @@ impl Waku {
                 TurnStatus::Interrupted,
                 crate::analytics::TurnOutcome::Cancelled,
             );
+            self.settle_automation_run(session_id, crate::automation::RunOutcome::Cancelled, cx);
         }
         if has_active_turn {
             self.capture_latest_turn_checkpoint_for(session_id);
@@ -1530,6 +1619,41 @@ impl Waku {
         .detach();
     }
 
+    /// Folder-picks a project and binds it to the open automation editor,
+    /// without creating a session or switching the globally selected project the
+    /// way [`Self::add_project`] does — the automation editor must stay put.
+    pub(super) fn add_project_for_automation(&mut self, cx: &mut Context<Self>) {
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some(tr!("project.add_project").into()),
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = receiver.await
+                && let Some(path) = paths.into_iter().next()
+            {
+                let _ = this.update(cx, |this, cx| {
+                    let project_id = match this.state.projects.iter().find(|p| p.path == path) {
+                        Some(existing) => existing.id,
+                        None => {
+                            let project = Project::from_path(path);
+                            let project_id = project.id;
+                            this.state.projects.push(project);
+                            this.analytics.track(crate::analytics::Event::ProjectAdded);
+                            project_id
+                        }
+                    };
+                    // Persist the new project even if the editor has since
+                    // closed; bind it to the form when it is still open.
+                    this.edit_automation_form(cx, |editor| editor.project_id = Some(project_id));
+                    this.save();
+                });
+            }
+        })
+        .detach();
+    }
+
     pub(super) fn create_projectless_session(&mut self, cx: &mut Context<Self>) {
         if let Some(draft_id) = self
             .state
@@ -1627,5 +1751,32 @@ mod tests {
                 assert!(retain_runtime_after_cancel(provider));
             }
         }
+    }
+
+    #[test]
+    fn removing_an_automation_session_settles_its_history_first() {
+        use crate::automation::{Automation, AutomationRun, RunOutcome};
+
+        let mut state = PersistedState::fresh(PathBuf::from("/tmp/project"));
+        let project_id = state.projects[0].id;
+        let mut automation = Automation::new("Nightly", ProviderKind::Codex, 1_000);
+        let automation_id = automation.id;
+        let mut session = state.new_session(project_id, ProviderKind::Codex);
+        session.originating_automation = Some(automation_id);
+        let session_id = session.id;
+        automation.record_run(AutomationRun::spawned(session_id, 1_100, false));
+        state.push_automation(automation);
+        state.push_session(session);
+
+        assert!(cancel_automation_run_for_removed_session(
+            &mut state, session_id
+        ));
+        assert_eq!(
+            state.automation(automation_id).unwrap().history[0].outcome,
+            RunOutcome::Cancelled
+        );
+        assert!(!cancel_automation_run_for_removed_session(
+            &mut state, session_id
+        ));
     }
 }

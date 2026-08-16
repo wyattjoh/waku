@@ -62,8 +62,9 @@ use crate::terminal::TerminalView;
 use crate::theme::{Theme, ThemePreference};
 use crate::ui::text_field::TextField;
 use crate::ui::{
-    MenuChip, ProjectNameSelector, activity_icon, activity_noun, contain_scroll, file_icon, icon,
-    icon_button, motion, provider_color, provider_icon, status_color, toggle_switch,
+    ActivationExt, MenuChip, ProjectNameSelector, activity_icon, activity_noun, contain_scroll,
+    file_icon, icon, icon_button, motion, provider_color, provider_icon, status_color,
+    toggle_switch,
 };
 use crate::{
     CancelTurn, CloseFind, CloseWindow, CopySelection, FindNext, FindPrevious, FocusComposer,
@@ -137,6 +138,9 @@ pub(crate) fn task_notification_tag(session_id: Uuid) -> String {
     format!("{TASK_NOTIFICATION_TAG_PREFIX}{session_id}")
 }
 
+/// Inverse of [`task_notification_tag`]. Both sides read the prefix from the
+/// same constant so a change to the tag format cannot silently break
+/// click-through on a delivered notification.
 pub(crate) fn task_id_from_notification_tag(tag: &str) -> Option<Uuid> {
     tag.strip_prefix(TASK_NOTIFICATION_TAG_PREFIX)?.parse().ok()
 }
@@ -228,6 +232,11 @@ impl SettingsPage {
     fn is_visible_in_navigation(self) -> bool {
         self != Self::ComputerUse || cfg!(all(debug_assertions, target_os = "macos"))
     }
+}
+
+enum ActivePage {
+    Settings(SettingsPage),
+    Automations(automations_page::AutomationsPage),
 }
 
 /// Which presentation the Usage page shows: the daily dashboard, the monthly
@@ -543,6 +552,8 @@ struct PendingCheckpointCapture {
 /// from [`SessionStatus`] lets the composer distinguish that non-cancellable
 /// preparation window from a connecting provider that can already be stopped.
 struct PreparedSubmission {
+    /// A projectless workspace allocated during background preparation.
+    project_path: Option<PathBuf>,
     workspace: SessionWorkspace,
     checkpoint_warning: Option<String>,
     /// `None` reuses an already-live runtime. `Some` contains the result of a
@@ -561,6 +572,12 @@ struct DriverStartRequest {
     daemon_client: waku_client::DaemonClient,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AutomationPreparationVersion {
+    automation_id: Uuid,
+    generation: u64,
+}
+
 /// A provider process that has started off-thread but is not installed into
 /// Waku's runtime map yet. Its event receiver safely buffers early events.
 struct PreparedDriver {
@@ -571,6 +588,12 @@ struct PreparedDriver {
 struct RemoteTaskStateSnapshot {
     projects: Vec<Project>,
     sessions: Vec<AgentSession>,
+    automations: Vec<crate::automation::Automation>,
+}
+
+enum TaskStateSyncEvent {
+    Snapshot(Result<RemoteTaskStateSnapshot, String>),
+    AutomationNotification(waku_client::AutomationNotification),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -669,7 +692,10 @@ impl WakuPane {
         content: fn(&mut Waku, &mut Window, &mut Context<Waku>) -> AnyElement,
         cx: &mut App,
     ) -> Entity<Self> {
-        cx.new(|_| Self { waku: None, content })
+        cx.new(|_| Self {
+            waku: None,
+            content,
+        })
     }
 
     fn bind(&mut self, waku: &Entity<Waku>, cx: &mut Context<Self>) {
@@ -1032,6 +1058,10 @@ pub struct Waku {
     daemon_reconfigure_pending: bool,
     daemon_token_revealed: bool,
     settings_focus: FocusHandle,
+    automations_focus: FocusHandle,
+    automation_save_focus: FocusHandle,
+    automation_delete_focus: FocusHandle,
+    automation_card_focuses: RefCell<HashMap<Uuid, FocusHandle>>,
     onboarding_add_project_focus: FocusHandle,
     onboarding_projectless_focus: FocusHandle,
     /// Mirror of Sparkle's persisted automatic-check setting. Refreshed when
@@ -1200,8 +1230,8 @@ pub struct Waku {
     /// Coalesced edge trigger for provider and background result queues. The
     /// payloads stay in their typed channels; this channel only wakes the UI.
     event_wake_tx: smol::channel::Sender<()>,
-    task_state_sync_tx: Sender<Result<RemoteTaskStateSnapshot, String>>,
-    task_state_sync_events: Receiver<Result<RemoteTaskStateSnapshot, String>>,
+    task_state_sync_tx: Sender<TaskStateSyncEvent>,
+    task_state_sync_events: Receiver<TaskStateSyncEvent>,
     runtimes: HashMap<Uuid, SessionRuntime>,
     runtime_attach_pending: HashSet<Uuid>,
     runtime_attach_misses: HashMap<Uuid, u8>,
@@ -1215,6 +1245,9 @@ pub struct Waku {
     /// session is busy immediately, while the composer draws a spinner until
     /// the non-cancellable preparation is complete.
     submission_preparations: HashSet<Uuid>,
+    /// Configuration generation captured by automation preparation. Editing,
+    /// disabling, or deleting invalidates every result already in flight.
+    automation_preparation_generations: HashMap<Uuid, u64>,
     /// First Escape press for the current turn. A matching second press stops
     /// the response; otherwise this returns to the ordinary Stop icon after a
     /// short timeout.
@@ -1318,7 +1351,22 @@ pub struct Waku {
     /// When the overlay could not be enabled, the browser falls back to
     /// swapping in frozen page pixels while an overlay is open.
     scene_overlay_enabled: bool,
-    settings_page: Option<SettingsPage>,
+    /// The full-page view, when open. `None` means the normal transcript
+    /// layout shows.
+    active_page: Option<ActivePage>,
+    /// The automation editor's name field, reused across edits like the session
+    /// rename input.
+    automation_name_input: Entity<ComposerInput>,
+    /// The automation editor's prompt field.
+    automation_prompt_input: Entity<ComposerInput>,
+    /// Freeform hour/minute fields for the schedule time, typed by hand.
+    automation_hour_input: Entity<ComposerInput>,
+    automation_minute_input: Entity<ComposerInput>,
+    /// Scroll position of the Automations page content.
+    automations_scroll: ScrollHandle,
+    /// Scroll position inside the automation editor's prompt field, which
+    /// scrolls within its own height before handing the wheel to the page.
+    automation_prompt_scroll: ScrollHandle,
     /// The Skills page's library snapshot, scanned off-thread. Frames read
     /// only this; `None` means the first scan has not landed yet.
     skills_catalog: Option<Rc<crate::skills::SkillsCatalog>>,
@@ -1354,6 +1402,9 @@ pub struct Waku {
     /// The skill directory whose delete button is armed for its confirming
     /// second click.
     skills_delete_arming: Option<PathBuf>,
+    /// Window-modal confirmation for deleting an automation, including the
+    /// optional cascade into its spawned sessions.
+    automation_delete_dialog: Option<automations_page::AutomationDeleteDialogState>,
     /// Scroll position of the settings content column, tracked so the pane
     /// can draw a scrollbar and mark the titlebar boundary once content
     /// slides under it.
@@ -1473,6 +1524,7 @@ pub struct Waku {
 }
 
 mod autocomplete;
+mod automations_page;
 mod background_work;
 mod branches;
 mod command_palette;
@@ -1497,6 +1549,7 @@ mod usage_page;
 mod window_chrome;
 
 pub use autocomplete::init as init_composer_autocomplete;
+pub use automations_page::init as init_automation_delete_dialog_keys;
 use background_work::{
     BackgroundWorkRegistry, work_kind_icon, work_status_color, work_status_label,
 };
@@ -1870,6 +1923,31 @@ impl Waku {
                 .search_field()
                 .placeholder(tr!("skills.search"))
         });
+        let automation_name_input = cx.new(|cx| {
+            ComposerInput::new(window, cx)
+                .search_field()
+                .placeholder(tr!("automations.name_placeholder"))
+        });
+        let automation_prompt_input = cx.new(|cx| {
+            // A multiline textarea, not a search box: Enter inserts a newline
+            // (the editor has no submit-on-Enter), and pasted line breaks are
+            // preserved rather than flattened to spaces.
+            ComposerInput::new(window, cx)
+                .code_editor(None)
+                .placeholder(tr!("automations.prompt_placeholder"))
+        });
+        let automation_hour_input = cx.new(|cx| {
+            ComposerInput::new(window, cx)
+                .search_field()
+                .select_all_on_focus_click()
+                .placeholder(tr!("automations.hour_placeholder"))
+        });
+        let automation_minute_input = cx.new(|cx| {
+            ComposerInput::new(window, cx)
+                .search_field()
+                .select_all_on_focus_click()
+                .placeholder(tr!("automations.minute_placeholder"))
+        });
         let session_rename_input = cx.new(|cx| ComposerInput::new(window, cx).search_field());
         let provider_path_input = cx.new(|cx| {
             ComposerInput::new(window, cx)
@@ -1954,6 +2032,7 @@ impl Waku {
             startup_live_session_ids.push(selected);
         }
         let mut interrupted_turn_checkpoints = Vec::new();
+        let mut interrupted_session_ids = Vec::new();
         for session in &mut state.sessions {
             session.migrate_legacy_state();
             // A provider runtime belongs to the daemon and may still be
@@ -1965,6 +2044,7 @@ impl Waku {
             }
             if session.status != SessionStatus::Idle {
                 session.status = SessionStatus::Idle;
+                interrupted_session_ids.push(session.id);
             }
             let interrupted_turn = if let Some(turn) = session
                 .turns
@@ -2011,6 +2091,9 @@ impl Waku {
             session
                 .transcript_blocks
                 .retain(|block| !block.activities.is_empty());
+        }
+        for session_id in interrupted_session_ids {
+            state.mark_session_dirty(session_id);
         }
         let initial_composer_draft = state
             .selected_session
@@ -2127,6 +2210,7 @@ impl Waku {
             .unwrap_or_default();
         let entity = cx.new(|cx| {
             let settings_focus = cx.focus_handle();
+            let automations_focus = cx.focus_handle();
             let onboarding_add_project_focus = cx.focus_handle();
             let onboarding_projectless_focus = cx.focus_handle();
             let updater_button_focus = cx.focus_handle();
@@ -2176,12 +2260,18 @@ impl Waku {
                     // app had focus — a checkout in a terminal, an edit in an
                     // editor. Coming back is the moment to re-check.
                     this.invalidate_workspace_queries(cx);
-                    if this.settings_page == Some(SettingsPage::ComputerUse) {
+                    if matches!(
+                        this.active_page.as_ref(),
+                        Some(ActivePage::Settings(SettingsPage::ComputerUse))
+                    ) {
                         this.request_computer_permissions(false, cx);
                     }
                     // Skill files are routinely edited in another app; coming
                     // back to the window is the moment to re-read them.
-                    if this.settings_page == Some(SettingsPage::Skills) {
+                    if matches!(
+                        this.active_page.as_ref(),
+                        Some(ActivePage::Settings(SettingsPage::Skills))
+                    ) {
                         this.ensure_skills_catalog(true, cx);
                     }
                 }
@@ -2387,6 +2477,28 @@ impl Waku {
                 },
             )
             .detach();
+            for input in [&automation_name_input, &automation_prompt_input] {
+                cx.subscribe(input, |_: &mut Self, _, event: &ComposerEvent, cx| {
+                    if matches!(event, ComposerEvent::Edited) {
+                        cx.notify();
+                    }
+                })
+                .detach();
+            }
+            for (input, minute_field) in [
+                (&automation_hour_input, false),
+                (&automation_minute_input, true),
+            ] {
+                cx.subscribe(
+                    input,
+                    move |this: &mut Self, _, event: &ComposerEvent, cx| {
+                        if matches!(event, ComposerEvent::Edited) {
+                            this.on_automation_time_edited(minute_field, cx);
+                        }
+                    },
+                )
+                .detach();
+            }
             cx.subscribe(
                 &session_rename_input,
                 |this: &mut Self, _, event: &ComposerEvent, cx| match event {
@@ -2553,6 +2665,10 @@ impl Waku {
                 daemon_reconfigure_pending: false,
                 daemon_token_revealed: false,
                 settings_focus,
+                automations_focus,
+                automation_save_focus: cx.focus_handle(),
+                automation_delete_focus: cx.focus_handle(),
+                automation_card_focuses: RefCell::new(HashMap::new()),
                 onboarding_add_project_focus,
                 onboarding_projectless_focus,
                 automatic_updates_enabled: cx
@@ -2650,6 +2766,7 @@ impl Waku {
                 background_work: HashMap::new(),
                 last_background_work_tick: Instant::now(),
                 submission_preparations: HashSet::new(),
+                automation_preparation_generations: HashMap::new(),
                 escape_stop_confirmation: EscapeStopConfirmation::default(),
                 response_fork_preparations: HashMap::new(),
                 pending_queue_drains: Vec::new(),
@@ -2708,7 +2825,13 @@ impl Waku {
                 right_panel_browsers: HashMap::new(),
                 right_panel_pending_browser_focus: None,
                 scene_overlay_enabled,
-                settings_page: None,
+                active_page: None,
+                automation_name_input,
+                automation_prompt_input,
+                automation_hour_input,
+                automation_minute_input,
+                automations_scroll: ScrollHandle::new(),
+                automation_prompt_scroll: ScrollHandle::new(),
                 skills_catalog: None,
                 skills_scan_generation: 0,
                 skills_scan_pending: false,
@@ -2724,6 +2847,7 @@ impl Waku {
                 skills_detail_scrollbar: ScrollbarState::new(),
                 skills_source_filter: None,
                 skills_delete_arming: None,
+                automation_delete_dialog: None,
                 settings_scroll: ScrollHandle::new(),
                 settings_scrollbar: ScrollbarState::new(),
                 header_drag_armed: false,

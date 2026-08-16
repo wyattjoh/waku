@@ -82,6 +82,7 @@ fn load_remote_task_state(
     let waku_client::ResponsePayload::TaskState {
         projects,
         mut sessions,
+        automations,
         ..
     } = response
     else {
@@ -90,7 +91,11 @@ fn load_remote_task_state(
     for session in &mut sessions {
         session.detail_loaded = false;
     }
-    Ok(RemoteTaskStateSnapshot { projects, sessions })
+    Ok(RemoteTaskStateSnapshot {
+        projects,
+        sessions,
+        automations,
+    })
 }
 
 /// Merge the daemon's list-only session projection into the desktop catalog.
@@ -136,18 +141,55 @@ pub(super) fn merge_remote_session_catalog(
     removed
 }
 
+fn automation_preparation_is_current(
+    version: Option<AutomationPreparationVersion>,
+    current: Option<&crate::automation::Automation>,
+    current_generation: Option<u64>,
+) -> bool {
+    match version {
+        None => true,
+        Some(version) => current.is_some_and(|automation| {
+            automation.id == version.automation_id
+                && automation.enabled
+                && current_generation.unwrap_or_default() == version.generation
+        }),
+    }
+}
+
+fn stream_save_delay(elapsed: Duration) -> Duration {
+    STREAM_SAVE_INTERVAL.saturating_sub(elapsed)
+}
+
 /// Perform every blocking operation between accepting a submission and
 /// starting its provider. This function is called only from the background
 /// executor; the UI thread owns applying the returned workspace afterward.
 fn prepare_submission(
     workspace_client: waku_client::WorkspaceClient,
-    project: Project,
+    mut project: Project,
     workspace: SessionWorkspace,
     driver_start: Option<anyhow::Result<DriverStartRequest>>,
     session_id: Uuid,
     prompt: &str,
     turn_count: usize,
 ) -> anyhow::Result<PreparedSubmission> {
+    let allocated_project_path = if project.is_projectless()
+        && crate::projectless::workspace_root().is_some_and(|root| project.path == root)
+    {
+        // The daemon owns the projectless workspace root, so allocation is an
+        // RPC rather than a local mkdir.
+        let cwd = match workspace_client.request(
+            waku_client::WorkspaceOperation::CreateProjectlessWorkspace {
+                prompt: Some(prompt.to_owned()),
+            },
+        )? {
+            waku_client::WorkspaceResult::ProjectlessWorkspace { cwd } => cwd,
+            _ => anyhow::bail!("the daemon returned an invalid projectless workspace response"),
+        };
+        project.path = cwd.clone();
+        Some(cwd)
+    } else {
+        None
+    };
     let workspace = match workspace {
         SessionWorkspace::NewWorktree { base_branch } => {
             if project.is_projectless() {
@@ -196,6 +238,7 @@ fn prepare_submission(
     });
 
     Ok(PreparedSubmission {
+        project_path: allocated_project_path,
         workspace,
         checkpoint_warning,
         driver,
@@ -876,8 +919,9 @@ impl Waku {
                         client = newer;
                     }
                     let revisions = client.subscribe_task_state();
+                    let notifications = client.subscribe_automation_notifications();
                     let result = load_remote_task_state(&client).map_err(|error| error.to_string());
-                    if results.send(result).is_err() {
+                    if results.send(TaskStateSyncEvent::Snapshot(result)).is_err() {
                         return;
                     }
                     signal_event_pump(&event_wake);
@@ -906,7 +950,22 @@ impl Waku {
                                 while revisions.try_recv().is_ok() {}
                                 let result = load_remote_task_state(&client)
                                     .map_err(|error| error.to_string());
-                                if results.send(result).is_err() {
+                                if results.send(TaskStateSyncEvent::Snapshot(result)).is_err() {
+                                    return;
+                                }
+                                signal_event_pump(&event_wake);
+                            }
+                            recv(notifications) -> notification => {
+                                let Ok(notification) = notification else {
+                                    let Ok(replacement) = clients.recv() else {
+                                        return;
+                                    };
+                                    break replacement;
+                                };
+                                if results
+                                    .send(TaskStateSyncEvent::AutomationNotification(notification))
+                                    .is_err()
+                                {
                                     return;
                                 }
                                 signal_event_pump(&event_wake);
@@ -919,22 +978,37 @@ impl Waku {
     }
 
     fn drain_task_state_sync_events(&mut self, cx: &mut Context<Self>) -> bool {
-        let mut latest = None;
-        while let Ok(result) = self.task_state_sync_events.try_recv() {
-            latest = Some(result);
+        let mut latest_snapshot = None;
+        let mut changed = false;
+        while let Ok(event) = self.task_state_sync_events.try_recv() {
+            match event {
+                TaskStateSyncEvent::Snapshot(result) => latest_snapshot = Some(result),
+                TaskStateSyncEvent::AutomationNotification(notification) => {
+                    let body = if notification.outcome == crate::automation::RunOutcome::Succeeded {
+                        tr!("automations.notify_succeeded")
+                    } else {
+                        tr!("automations.notify_failed")
+                    };
+                    crate::platform::show_task_notification(
+                        &task_notification_tag(notification.session_id),
+                        &notification.name,
+                        &body,
+                        cx,
+                    );
+                    changed = true;
+                }
+            }
         }
-        let Some(result) = latest else {
-            return false;
-        };
-        match result {
-            Ok(snapshot) => {
+        match latest_snapshot {
+            Some(Ok(snapshot)) => {
                 self.apply_remote_task_state(snapshot, cx);
                 true
             }
-            Err(error) => {
+            Some(Err(error)) => {
                 eprintln!("could not refresh daemon task state: {error}");
-                false
+                changed
             }
+            None => changed,
         }
     }
 
@@ -957,6 +1031,7 @@ impl Waku {
             self.remove_right_panel_session_state(*session_id);
         }
         self.state.projects = snapshot.projects;
+        self.state.automations = snapshot.automations;
 
         let attach = self
             .state
@@ -1162,6 +1237,16 @@ impl Waku {
         }
         self.save();
         cx.notify();
+    }
+
+    pub(super) fn schedule_stream_state_save(&self, cx: &mut Context<Self>) {
+        let delay = stream_save_delay(self.last_stream_save.elapsed());
+        let event_wake = self.event_wake_tx.clone();
+        cx.spawn(async move |_, cx| {
+            cx.background_executor().timer(delay).await;
+            signal_event_pump(&event_wake);
+        })
+        .detach();
     }
 
     pub fn composer_focus(&self, cx: &App) -> FocusHandle {
@@ -1512,7 +1597,19 @@ impl Waku {
         session: &AgentSession,
     ) -> Option<&ProviderModel> {
         let model = self.model_for_session(session)?;
-        self.provider_probe(session.provider)?
+        self.model_metadata(session.provider, Some(model))
+    }
+
+    /// The catalog metadata for an explicit `(provider, model_id)`, independent
+    /// of any session. Used by the shared agent controls, which resolve their
+    /// current model from either the session or the automation form.
+    pub(super) fn model_metadata(
+        &self,
+        provider: ProviderKind,
+        model: Option<&str>,
+    ) -> Option<&ProviderModel> {
+        let model = model?;
+        self.provider_probe(provider)?
             .models
             .iter()
             .find(|candidate| candidate.id == model)
@@ -2649,7 +2746,7 @@ impl Waku {
         })
     }
 
-    fn install_prepared_driver(
+    pub(super) fn install_prepared_driver(
         &mut self,
         session_id: Uuid,
         prepared: PreparedDriver,
@@ -2857,7 +2954,7 @@ impl Waku {
         );
     }
 
-    fn submit_submission_for_session(
+    pub(super) fn submit_submission_for_session(
         &mut self,
         session_id: Uuid,
         submission: ComposerSubmission,
@@ -2912,6 +3009,18 @@ impl Waku {
                 .map(std::path::Path::to_path_buf)
                 .unwrap_or_default();
             self.driver_start_request_for_session(session, provisional_cwd)
+        });
+        let automation_version = session.originating_automation.and_then(|automation_id| {
+            self.state
+                .automation(automation_id)
+                .map(|_| AutomationPreparationVersion {
+                    automation_id,
+                    generation: self
+                        .automation_preparation_generations
+                        .get(&automation_id)
+                        .copied()
+                        .unwrap_or_default(),
+                })
         });
         let Some(project) = self
             .state
@@ -3017,15 +3126,67 @@ impl Waku {
                 })
                 .await;
             let _ = waku.update(cx, move |waku, cx| {
-                waku.finish_submission_preparation(session_id, submission, prepared, cx);
+                waku.finish_submission_preparation(
+                    session_id,
+                    automation_version,
+                    submission,
+                    prepared,
+                    cx,
+                );
             });
         })
         .detach();
     }
 
+    fn finish_manual_preparation_failure(&mut self, session_id: Uuid) {
+        self.track_active_turn_outcome(
+            session_id,
+            crate::analytics::TurnOutcome::PreparationFailed,
+        );
+        if let Some(session) = self.state.session_mut(session_id)
+            && session.status == SessionStatus::Connecting
+        {
+            // Manual submissions return to the composer when preparation never
+            // reaches a provider.
+            if let Some(turn_id) = session.active_turn_id() {
+                session.unwind_unstarted_turn(turn_id);
+            }
+            session.status = SessionStatus::Idle;
+        }
+    }
+
+    fn finish_automation_preparation_failure(
+        &mut self,
+        session_id: Uuid,
+        error: &anyhow::Error,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(session) = self.state.session_mut(session_id)
+            && session.status == SessionStatus::Connecting
+        {
+            session.status = SessionStatus::Failed;
+            // Unlike the manual path's transient toast, this message is the
+            // durable record of why an unattended run never started, so it must
+            // not name a worktree for a failure that had nothing to do with one.
+            session.push_message(
+                MessageRole::Assistant,
+                tr!("errors.prepare_automation_run", error = error),
+            );
+        }
+        self.finish_active_turn_with_analytics(
+            session_id,
+            TurnStatus::Failed,
+            crate::analytics::TurnOutcome::PreparationFailed,
+        );
+        self.settle_automation_run(session_id, crate::automation::RunOutcome::Failed, cx);
+        self.stream_state_dirty = true;
+        self.schedule_stream_state_save(cx);
+    }
+
     fn finish_submission_preparation(
         &mut self,
         session_id: Uuid,
+        automation_version: Option<AutomationPreparationVersion>,
         submission: ComposerSubmission,
         prepared: anyhow::Result<PreparedSubmission>,
         cx: &mut Context<Self>,
@@ -3034,14 +3195,44 @@ impl Waku {
             return;
         }
         let selected = self.state.selected_session == Some(session_id);
+        let current_automation =
+            automation_version.and_then(|version| self.state.automation(version.automation_id));
+        let current_generation = automation_version.and_then(|version| {
+            self.automation_preparation_generations
+                .get(&version.automation_id)
+                .copied()
+        });
+        let stale_automation = !automation_preparation_is_current(
+            automation_version,
+            current_automation,
+            current_generation,
+        );
+        if stale_automation {
+            self.submission_preparations.remove(&session_id);
+            if let Some(session) = self.state.session_mut(session_id) {
+                session.status = SessionStatus::Idle;
+            }
+            self.finish_active_turn_with_analytics(
+                session_id,
+                TurnStatus::Interrupted,
+                crate::analytics::TurnOutcome::Cancelled,
+            );
+            self.settle_automation_run(session_id, crate::automation::RunOutcome::Cancelled, cx);
+            self.stream_state_dirty = true;
+            self.schedule_stream_state_save(cx);
+            cx.notify();
+            return;
+        }
         let prepared = match prepared {
             Ok(prepared) => prepared,
             Err(error) => {
                 self.submission_preparations.remove(&session_id);
-                self.track_active_turn_outcome(
-                    session_id,
-                    crate::analytics::TurnOutcome::PreparationFailed,
-                );
+                let is_automation = self
+                    .state
+                    .sessions
+                    .iter()
+                    .find(|session| session.id == session_id)
+                    .is_some_and(|session| session.originating_automation.is_some());
                 if selected {
                     self.sync_transcript_rows();
                 }
@@ -3050,17 +3241,13 @@ impl Waku {
                 } else {
                     Vec::new()
                 };
-                if let Some(session) = self.state.session_mut(session_id)
-                    && session.status == SessionStatus::Connecting
-                {
-                    // The submission never reached a provider and its prompt
-                    // returns to the composer, so the eagerly-begun turn and
-                    // its message leave the transcript with it.
-                    if let Some(turn_id) = session.active_turn_id() {
-                        session.unwind_unstarted_turn(turn_id);
-                    }
-                    session.status = SessionStatus::Idle;
-                }
+                let restore_submission = if is_automation {
+                    self.finish_automation_preparation_failure(session_id, &error, cx);
+                    false
+                } else {
+                    self.finish_manual_preparation_failure(session_id);
+                    true
+                };
                 if selected {
                     if self
                         .transcript_anchor
@@ -3071,18 +3258,40 @@ impl Waku {
                         self.transcript_anchor_following.set(false);
                     }
                     self.splice_transcript_rows_after_visibility_change(&previous_kinds);
-                    self.restore_composer_submission(submission, cx);
-                    self.show_toast(tr!("errors.create_worktree", error = error));
+                    if restore_submission {
+                        self.restore_composer_submission(submission, cx);
+                    }
+                    // Preparation covers more than the worktree — allocating a
+                    // projectless workspace, and the daemon responses behind
+                    // both — so the toast names the step that failed rather
+                    // than one of the things it might have been.
+                    self.show_toast(tr!("errors.prepare_task", error = error));
                 }
                 cx.notify();
                 return;
             }
         };
         let PreparedSubmission {
+            project_path,
             workspace,
             checkpoint_warning,
             driver: prepared_driver,
         } = prepared;
+        if let Some(project_path) = project_path
+            && let Some(project_id) = self
+                .state
+                .sessions
+                .iter()
+                .find(|session| session.id == session_id)
+                .map(|session| session.project_id)
+            && let Some(project) = self
+                .state
+                .projects
+                .iter_mut()
+                .find(|project| project.id == project_id)
+        {
+            project.path = project_path;
+        }
         // The turn began at accept time; it must still be the untouched one
         // this preparation belongs to. Cancellation is blocked while the
         // preparation set holds the session, so a mismatch means the session
@@ -3173,6 +3382,7 @@ impl Waku {
         // show Stop (or Send after failure), never the preparation spinner.
         self.submission_preparations.remove(&session_id);
         if failed_to_start {
+            self.settle_automation_run(session_id, crate::automation::RunOutcome::Failed, cx);
             self.capture_latest_turn_checkpoint_for(session_id);
             self.start_pending_checkpoint_captures(cx);
         }
@@ -3394,6 +3604,66 @@ mod response_fork_title_tests {
             next_response_fork_title("Plan (2026)", ["Plan (2026)"]),
             "Plan (2026) (2)"
         );
+    }
+}
+
+#[cfg(test)]
+mod automation_preparation_tests {
+    use std::time::Duration;
+
+    use super::{
+        AutomationPreparationVersion, automation_preparation_is_current, stream_save_delay,
+    };
+    use crate::app::STREAM_SAVE_INTERVAL;
+    use crate::automation::Automation;
+    use crate::model::ProviderKind;
+
+    #[test]
+    fn deleted_disabled_and_superseded_automation_preparations_are_stale() {
+        let mut automation = Automation::new("Nightly", ProviderKind::Codex, 1_000);
+        let version = Some(AutomationPreparationVersion {
+            automation_id: automation.id,
+            generation: 3,
+        });
+        assert!(automation_preparation_is_current(
+            version,
+            Some(&automation),
+            Some(3)
+        ));
+        let initial_version = Some(AutomationPreparationVersion {
+            automation_id: automation.id,
+            generation: 0,
+        });
+        assert!(automation_preparation_is_current(
+            initial_version,
+            Some(&automation),
+            None
+        ));
+        assert!(!automation_preparation_is_current(version, None, Some(3)));
+
+        automation.enabled = false;
+        assert!(!automation_preparation_is_current(
+            version,
+            Some(&automation),
+            Some(3)
+        ));
+        automation.enabled = true;
+        assert!(!automation_preparation_is_current(
+            version,
+            Some(&automation),
+            Some(4)
+        ));
+        assert!(automation_preparation_is_current(None, None, None));
+    }
+
+    #[test]
+    fn deferred_stream_saves_wait_only_for_the_remaining_batch_interval() {
+        assert_eq!(stream_save_delay(Duration::ZERO), STREAM_SAVE_INTERVAL);
+        assert_eq!(
+            stream_save_delay(STREAM_SAVE_INTERVAL / 2),
+            STREAM_SAVE_INTERVAL / 2
+        );
+        assert_eq!(stream_save_delay(STREAM_SAVE_INTERVAL * 2), Duration::ZERO);
     }
 }
 
