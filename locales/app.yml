@@ -72,12 +72,16 @@ command_palette.suggested:
   en: Suggested
 command_palette.tasks:
   en: Tasks
+command_palette.automations:
+  en: Automations
 command_palette.commands:
   en: Commands
 command_palette.settings:
   en: Settings
 command_palette.new_task:
   en: New task
+command_palette.new_automation:
+  en: New automation…
 command_palette.open_project:
   en: Open project…
 command_palette.choose_model:
@@ -92,6 +96,8 @@ command_palette.hide_right_panel:
   en: Hide right panel
 command_palette.current:
   en: Current
+command_palette.automation_run:
+  en: "Automation: %{name}"
 command_palette.you:
   en: You
 command_palette.agent:
@@ -420,6 +426,248 @@ sidebar.today:
   en: Today
 sidebar.search:
   en: Search
+sidebar.automations:
+  en: Automations
+sidebar.automation_deleted:
+  en: Automation
+automations.title:
+  en: Automations
+automations.new:
+  en: New automation
+automations.empty_title:
+  en: No automations yet
+automations.empty_body:
+  en: Create an automation to run a saved prompt on a daily, weekly, or monthly schedule.
+automations.default_name:
+  en: New automation
+automations.name_placeholder:
+  en: Automation name
+automations.prompt_placeholder:
+  en: What should this automation do?
+automations.hour_placeholder:
+  en: HH
+automations.minute_placeholder:
+  en: MM
+automations.prompt_required:
+  en: Add a prompt before saving this automation.
+automations.name_required:
+  en: Add a name before saving this automation.
+automations.web_description:
+  en: Review scheduled work, run outcomes, and transcripts.
+automations.authoring_description:
+  en: Configure the prompt, agent, schedule, overlap, and notification policy.
+automations.daemon_required:
+  en: Scheduled runs only fire while a Waku client is running.
+automations.client_connected:
+  en: Waku client connected
+automations.client_disconnected:
+  en: Waku client disconnected
+automations.empty_read_body:
+  en: Automations created in Waku will appear here with their run history.
+automations.history:
+  en: Run history
+automations.no_runs:
+  en: No runs recorded yet.
+automations.select_hint:
+  en: Select an automation to inspect its schedule and run history.
+automations.run_started:
+  en: Automation run started
+automations.saved:
+  en: Automation saved
+automations.deleted:
+  en: Automation deleted
+automations.run_transcript:
+  en: Run transcript
+automations.loading_transcript:
+  en: Loading transcript…
+automations.transcript_unavailable:
+  en: This run has no available transcript.
+automations.open_task:
+  en: Open task
+automations.catch_up:
+  en: catch-up
+automations.notifications_off:
+  en: Off
+automations.model_description:
+  en: Leave blank to use the provider default.
+automations.field_service_tier:
+  en: Service tier
+automations.field_agent_preset:
+  en: Agent preset
+automations.field_interaction:
+  en: Interaction
+automations.delete_safe_description:
+  en: The automation will be removed, but its sessions and transcripts will be kept.
+automations.delete_sessions_exact:
+  en: Also delete exactly %{count} sessions and their transcripts.
+automations.frequency_hourly:
+  en: Hourly
+automations.outcome_running:
+  en: Running
+automations.outcome_succeeded:
+  en: Succeeded
+automations.outcome_failed:
+  en: Failed
+automations.outcome_cancelled:
+  en: Cancelled
+automations.outcome_skipped:
+  en: Skipped
+automations.create_title:
+  en: New automation
+automations.edit_title:
+  en: Edit automation
+automations.save:
+  en: Save
+automations.create:
+  en: Create
+automations.save_failed_missing:
+  en: This automation was deleted elsewhere. Create it again to keep your changes.
+automations.prompt_missing:
+  en: Add instructions — scheduled runs will not start without them.
+automations.cancel:
+  en: Cancel
+automations.edit:
+  en: Edit
+automations.delete:
+  en: Delete
+automations.confirm_delete:
+  en: Confirm delete
+automations.delete_title:
+  en: "Delete \"%{name}\"?"
+automations.delete_runs:
+  en: This automation has %{count} runs.
+automations.delete_sessions:
+  en: Also delete its %{count} sessions and their transcripts.
+automations.delete_irreversible:
+  en: This cannot be undone.
+automations.delete_sessions_partial:
+  en: "Could not delete %{count} sessions because a response fork is in progress."
+automations.run_now:
+  en: Run now
+automations.notify_succeeded:
+  en: Automation run completed
+automations.notify_failed:
+  en: Automation run failed
+automations.enabled:
+  en: Enabled
+automations.disabled:
+  en: Disabled
+automations.menu_disable:
+  en: Disable
+automations.menu_enable:
+  en: Enable
+automations.next_run:
+  en: "Next run %{time}"
+automations.next_run_none:
+  en: Not scheduled
+automations.field_name:
+  en: Name
+automations.field_name_description:
+  en: Shown in the sidebar, in notifications, and in the command palette.
+automations.field_instructions:
+  en: Instructions
+automations.field_instructions_description:
+  en: What the agent is asked to do on every run.
+automations.field_provider:
+  en: Provider
+automations.field_model:
+  en: Model
+automations.field_effort:
+  en: Reasoning effort
+automations.field_permission:
+  en: Permission
+automations.field_project:
+  en: Project
+automations.field_schedule_frequency:
+  en: Frequency
+automations.field_schedule_frequency_description:
+  en: How often a run starts.
+automations.field_time:
+  en: Time
+automations.field_time_description:
+  en: The local time each run starts.
+automations.field_minute_description:
+  en: The minute past every hour each run starts.
+automations.field_days:
+  en: Days
+automations.field_weekdays_description:
+  en: The days of the week a run starts.
+automations.field_monthdays_description:
+  en: The days of the month a run starts. Months without a day skip it.
+automations.field_overlap:
+  en: If already running
+automations.field_overlap_description:
+  en: What to do when the previous run is still going.
+automations.field_notifications:
+  en: Notifications
+automations.field_notifications_description:
+  en: Post a system notification when a run finishes.
+automations.field_notify_when:
+  en: Notify
+automations.field_notify_when_description:
+  en: Which outcomes are worth a notification.
+automations.field_enabled_description:
+  en: A disabled automation keeps its schedule but never fires.
+automations.model_default:
+  en: Provider default
+automations.effort_default:
+  en: Default
+automations.no_project:
+  en: No project
+automations.workspace_worktree:
+  en: Fresh worktree per run
+automations.overlap_skip:
+  en: Skip this run
+automations.overlap_queue:
+  en: Queue until free
+automations.overlap_concurrent:
+  en: Run anyway
+automations.notify_always:
+  en: Always
+automations.notify_success:
+  en: On success
+automations.notify_failure:
+  en: On failure
+automations.frequency_daily:
+  en: Daily
+automations.frequency_weekly:
+  en: Weekly
+automations.frequency_monthly:
+  en: Monthly
+automations.preset_manual:
+  en: Manual
+automations.preset_hourly:
+  en: Hourly
+automations.preset_weekdays:
+  en: Weekdays
+automations.hint_manual:
+  en: Runs only when you start it
+automations.at_minute:
+  en: "At :"
+automations.summary_daily:
+  en: "Daily at %{time}"
+automations.summary_weekly:
+  en: "Weekly on %{days} at %{time}"
+automations.summary_monthly:
+  en: "Monthly on day %{days} at %{time}"
+automations.summary_manual:
+  en: Manual — no schedule
+automations.summary_hourly:
+  en: "Every hour at :%{minute}"
+automations.weekday_mon:
+  en: Mon
+automations.weekday_tue:
+  en: Tue
+automations.weekday_wed:
+  en: Wed
+automations.weekday_thu:
+  en: Thu
+automations.weekday_fri:
+  en: Fri
+automations.weekday_sat:
+  en: Sat
+automations.weekday_sun:
+  en: Sun
 sidebar.yesterday:
   en: Yesterday
 sidebar.this_week:
@@ -460,6 +708,10 @@ sidebar.status_waiting:
   en: Waiting
 sidebar.status_failed:
   en: Failed
+sidebar.show_more_runs:
+  en: Show %{count} more
+sidebar.show_fewer_runs:
+  en: Show less
 
 project.new_project:
   en: New project…
@@ -1234,6 +1486,12 @@ errors.store_pasted_image:
   en: "Could not attach the pasted image: %{error}"
 errors.create_worktree:
   en: "Could not create the worktree: %{error}"
+errors.prepare_automation_run:
+  en: "Could not prepare the automation run: %{error}"
+errors.prepare_task:
+  en: "Could not prepare the task: %{error}"
+errors.run_automation:
+  en: "Could not start the automation: %{error}"
 errors.prepared_runtime_unavailable:
   en: The prepared agent runtime is unavailable
 errors.start_agent:
