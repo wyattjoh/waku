@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{Command, DaemonExposureSettings, DaemonSettings, DaemonSupervisor, ResponsePayload};
+use waku_protocol::automation::{Automation, AutomationChange};
 use waku_protocol::computer_use::ComputerAppGrant;
 use waku_protocol::i18n::AppLanguage;
 use waku_protocol::identity::DATA_DIRECTORY_NAME;
@@ -272,6 +273,10 @@ pub struct PersistedState {
     pub analytics_enabled: bool,
     pub projects: Vec<Project>,
     pub sessions: Vec<AgentSession>,
+    /// Saved scheduling automations mirrored from the daemon. Local authoring
+    /// queues per-automation changes so saving never replaces unrelated state.
+    #[serde(default)]
+    pub automations: Vec<Automation>,
     pub selected_project: Option<Uuid>,
     pub selected_session: Option<Uuid>,
     pub last_provider: ProviderKind,
@@ -315,6 +320,8 @@ pub struct PersistedState {
     daemon_settings_extra: BTreeMap<String, serde_json::Value>,
     #[serde(skip)]
     dirty_sessions: HashSet<Uuid>,
+    #[serde(skip)]
+    pending_automation_changes: Vec<AutomationChange>,
 }
 
 impl PersistedState {
@@ -333,6 +340,55 @@ impl PersistedState {
         self.sessions.push(session);
     }
 
+    pub fn automation(&self, id: Uuid) -> Option<&Automation> {
+        self.automations
+            .iter()
+            .find(|automation| automation.id == id)
+    }
+
+    pub fn automation_mut(&mut self, id: Uuid) -> Option<&mut Automation> {
+        self.automations
+            .iter_mut()
+            .find(|automation| automation.id == id)
+    }
+
+    pub fn push_automation(&mut self, automation: Automation) {
+        self.automations.push(automation);
+    }
+
+    /// Removes an automation, returning whether one was found.
+    pub fn remove_automation(&mut self, id: Uuid) -> bool {
+        let before = self.automations.len();
+        self.automations.retain(|automation| automation.id != id);
+        self.automations.len() != before
+    }
+
+    pub fn queue_automation_upsert(&mut self, automation: Automation) {
+        self.pending_automation_changes
+            .retain(|change| change.automation_id() != automation.id);
+        self.pending_automation_changes
+            .push(AutomationChange::Upsert { automation });
+    }
+
+    pub fn queue_automation_removal(&mut self, automation_id: Uuid, cascade_sessions: bool) {
+        self.pending_automation_changes
+            .retain(|change| change.automation_id() != automation_id);
+        self.pending_automation_changes
+            .push(AutomationChange::Remove {
+                automation_id,
+                cascade_sessions,
+            });
+    }
+
+    fn take_automation_changes(&mut self) -> Vec<AutomationChange> {
+        std::mem::take(&mut self.pending_automation_changes)
+    }
+
+    fn restore_automation_changes(&mut self, mut changes: Vec<AutomationChange>) {
+        changes.append(&mut self.pending_automation_changes);
+        self.pending_automation_changes = changes;
+    }
+
     pub fn empty() -> Self {
         Self {
             version: STATE_VERSION,
@@ -340,6 +396,7 @@ impl PersistedState {
             analytics_enabled: true,
             projects: Vec::new(),
             sessions: Vec::new(),
+            automations: Vec::new(),
             selected_project: None,
             selected_session: None,
             last_provider: ProviderKind::Codex,
@@ -363,6 +420,7 @@ impl PersistedState {
             provider_binary_overrides: HashMap::new(),
             daemon_settings_extra: BTreeMap::new(),
             dirty_sessions: HashSet::new(),
+            pending_automation_changes: Vec::new(),
         }
     }
 
@@ -386,9 +444,7 @@ impl PersistedState {
                 .reasoning_effort
                 .clone_from(&self.last_reasoning_effort);
             session.service_tier.clone_from(&self.last_service_tier);
-            session
-                .context_window
-                .clone_from(&self.last_context_window);
+            session.context_window.clone_from(&self.last_context_window);
         }
         session
     }
@@ -784,7 +840,7 @@ impl StateStore {
     }
 
     pub fn load(&self) -> io::Result<PersistedState> {
-        let (projects, mut sessions, default_cwd) = match self
+        let (projects, mut sessions, automations, default_cwd) = match self
             .daemon
             .client()
             .request(Uuid::nil(), Uuid::nil(), Command::LoadTaskState)
@@ -793,11 +849,12 @@ impl StateStore {
             ResponsePayload::TaskState {
                 projects,
                 sessions,
+                automations,
                 default_cwd,
                 projectless_root,
             } => {
                 waku_protocol::projectless::set_workspace_root(projectless_root);
-                (projects, sessions, default_cwd)
+                (projects, sessions, automations, default_cwd)
             }
             _ => {
                 return Err(io::Error::other(
@@ -810,6 +867,7 @@ impl StateStore {
         let mut state = PersistedState::empty();
         state.projects = projects;
         state.sessions = sessions;
+        state.automations = automations;
         let app_settings_missing = !self.app_settings_path.is_file();
         if let Some(settings) = self.read_app_settings()? {
             state.apply_app_settings(settings);
@@ -853,6 +911,35 @@ impl StateStore {
                 io::ErrorKind::NotConnected,
                 "task state was not loaded; refusing to overwrite daemon data",
             ));
+        }
+        let automation_changes = state.take_automation_changes();
+        if !automation_changes.is_empty() {
+            let response = self
+                .daemon
+                .client()
+                .request(
+                    Uuid::nil(),
+                    Uuid::nil(),
+                    Command::ApplyAutomationChanges {
+                        changes: automation_changes.clone(),
+                    },
+                )
+                .map_err(to_io_error);
+            match response {
+                Ok(ResponsePayload::AutomationChangesApplied { automations }) => {
+                    state.automations = automations;
+                }
+                Ok(_) => {
+                    state.restore_automation_changes(automation_changes);
+                    return Err(io::Error::other(
+                        "Waku daemon returned an invalid automation-change response",
+                    ));
+                }
+                Err(error) => {
+                    state.restore_automation_changes(automation_changes);
+                    return Err(error);
+                }
+            }
         }
         let dirty_ids = state.dirty_sessions.clone();
         let sessions = state
@@ -996,6 +1083,33 @@ mod tests {
     }
 
     #[test]
+    fn automation_deltas_coalesce_only_their_matching_target() {
+        let mut state = PersistedState::empty();
+        let first = Automation::new("First", ProviderKind::Codex, 1);
+        let second = Automation::new("Second", ProviderKind::Codex, 1);
+        let mut renamed = first.clone();
+        renamed.name = "Renamed".to_owned();
+
+        state.queue_automation_upsert(first);
+        state.queue_automation_upsert(second.clone());
+        state.queue_automation_upsert(renamed.clone());
+        state.queue_automation_removal(second.id, true);
+
+        assert_eq!(
+            state.take_automation_changes(),
+            vec![
+                AutomationChange::Upsert {
+                    automation: renamed,
+                },
+                AutomationChange::Remove {
+                    automation_id: second.id,
+                    cascade_sessions: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn daemon_task_state_becomes_list_only_after_crossing_the_client_boundary() {
         let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
         session.detail_loaded = false;
@@ -1009,6 +1123,7 @@ mod tests {
             sessions: vec![session],
             default_cwd: PathBuf::from("/daemon/project"),
             projectless_root: None,
+            automations: Vec::new(),
         })
         .unwrap();
         let ResponsePayload::TaskState { mut sessions, .. } =
