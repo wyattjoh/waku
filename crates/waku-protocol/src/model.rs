@@ -787,6 +787,11 @@ pub struct AgentSession {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_preset: Option<String>,
     pub status: SessionStatus,
+    /// The automation this session was spawned by, when it originated from one.
+    /// A promoted column, so the sidebar can badge the row without hydrating
+    /// the transcript.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub originating_automation: Option<Uuid>,
     pub created_at: u64,
     /// Any mutation, including title edits and truncation. Use
     /// [`Self::last_reply_at`] for conversation recency.
@@ -857,6 +862,7 @@ impl AgentSession {
             context_window: None,
             agent_preset: None,
             status: SessionStatus::Idle,
+            originating_automation: None,
             created_at: now,
             updated_at: now,
             last_reply_at: None,
@@ -894,6 +900,10 @@ impl AgentSession {
             context_window: None,
             agent_preset: None,
             status: self.status,
+            // The sidebar groups runs under their automation straight from the
+            // catalog, so this projection must carry the link even though it
+            // drops every other detail field.
+            originating_automation: self.originating_automation,
             created_at: self.created_at,
             updated_at: self.updated_at,
             last_reply_at: self.last_reply_at,

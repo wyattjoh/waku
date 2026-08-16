@@ -25,6 +25,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::automation::Automation;
 use crate::blob_store::BlobStore;
 use crate::computer_use::ComputerAppGrant;
 use crate::i18n::AppLanguage;
@@ -249,6 +250,10 @@ pub struct PersistedState {
     pub analytics_enabled: bool,
     pub projects: Vec<Project>,
     pub sessions: Vec<AgentSession>,
+    /// Saved scheduling automations. Read whole and reconciled on save; no
+    /// dirty tracking because they are few and cheap to re-serialize.
+    #[serde(default)]
+    pub automations: Vec<Automation>,
     pub selected_project: Option<Uuid>,
     pub selected_session: Option<Uuid>,
     pub last_provider: ProviderKind,
@@ -327,6 +332,7 @@ impl PersistedState {
             analytics_enabled: true,
             projects: Vec::new(),
             sessions: Vec::new(),
+            automations: Vec::new(),
             selected_project: None,
             selected_session: None,
             last_provider: ProviderKind::Codex,
@@ -371,9 +377,7 @@ impl PersistedState {
                 .reasoning_effort
                 .clone_from(&self.last_reasoning_effort);
             session.service_tier.clone_from(&self.last_service_tier);
-            session
-                .context_window
-                .clone_from(&self.last_context_window);
+            session.context_window.clone_from(&self.last_context_window);
         }
         session
     }
@@ -663,10 +667,37 @@ fn collect_references(data: &str, scheme: &str, references: &mut HashSet<String>
 }
 
 fn fingerprint(value: &str) -> u64 {
+    fingerprint_pieces([value])
+}
+
+/// Encode every automation once, paired with the fingerprint of exactly those
+/// encodings.
+///
+/// The save path keeps the encodings to write them, and both the load seed and
+/// the save comparison must hash the same pieces. Hashing the whole array on one
+/// side and the concatenated items on the other silently makes the two values
+/// unequal forever, so the first save after every load rewrites the whole table.
+fn encode_automations(automations: &[Automation]) -> io::Result<(Vec<(Uuid, String)>, u64)> {
+    let encoded = automations
+        .iter()
+        .map(|automation| {
+            Ok::<_, io::Error>((
+                automation.id,
+                serde_json::to_string(automation).map_err(to_io_error)?,
+            ))
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    let fingerprint = fingerprint_pieces(encoded.iter().map(|(_, data)| data.as_str()));
+    Ok((encoded, fingerprint))
+}
+
+fn fingerprint_pieces<'a>(pieces: impl IntoIterator<Item = &'a str>) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in value.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    for piece in pieces {
+        for byte in piece.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
     }
     hash
 }
@@ -841,6 +872,10 @@ struct Storage {
     /// See [`write_messages`].
     written_messages: HashMap<Uuid, HashMap<Uuid, u64>>,
     saved_projects: u64,
+    /// Automation ids successfully decoded by this binary. Unknown rows are
+    /// deliberately absent so ordinary reconciliation can never delete them.
+    persisted_automations: HashSet<Uuid>,
+    saved_automations: u64,
     saved_app_settings: u64,
     saved_app_state: u64,
 }
@@ -1105,7 +1140,7 @@ impl StateStore {
         let mut sessions = connection
             .prepare(
                 "SELECT id, project_id, title, auto_title, provider, model, status,
-                        created_at, updated_at, last_reply_at
+                        originating_automation, created_at, updated_at, last_reply_at
                  FROM sessions ORDER BY updated_at",
             )
             .map_err(to_io_error)?;
@@ -1120,9 +1155,10 @@ impl StateStore {
                     row.get::<_, String>(4)?,
                     row.get::<_, Option<String>>(5)?,
                     row.get::<_, String>(6)?,
-                    row.get::<_, i64>(7)?,
+                    row.get::<_, Option<String>>(7)?,
                     row.get::<_, i64>(8)?,
-                    row.get::<_, Option<i64>>(9)?,
+                    row.get::<_, i64>(9)?,
+                    row.get::<_, Option<i64>>(10)?,
                 ))
             })
             .map_err(to_io_error)?
@@ -1134,6 +1170,31 @@ impl StateStore {
             })
             .collect();
         drop(sessions);
+
+        // Automations are stored whole as a JSON blob. Rows this binary cannot
+        // decode stay in SQLite and are excluded from known-row reconciliation.
+        let mut automations = connection
+            .prepare("SELECT id, data FROM automations")
+            .map_err(to_io_error)?;
+        let mut persisted_automations = HashSet::new();
+        for row in automations
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(to_io_error)?
+        {
+            let (stored_id, data) = row.map_err(to_io_error)?;
+            match serde_json::from_str::<Automation>(&data) {
+                Ok(automation) => {
+                    persisted_automations.insert(automation.id);
+                    state.automations.push(automation);
+                }
+                Err(error) => {
+                    eprintln!("failed to decode automation row {stored_id}; preserving it: {error}")
+                }
+            }
+        }
+        drop(automations);
 
         state.migrate_loaded();
         let app_settings = state.app_settings();
@@ -1158,6 +1219,8 @@ impl StateStore {
             // are skeletons anyway, so the first save of one is a full write.
             written_messages: HashMap::new(),
             saved_projects: 0,
+            persisted_automations,
+            saved_automations: encode_automations(&state.automations)?.1,
             saved_app_settings: if app_settings_are_saved {
                 fingerprint(&serde_json::to_string(&app_settings).map_err(to_io_error)?)
             } else {
@@ -1188,6 +1251,8 @@ impl StateStore {
                 persisted_sessions: HashSet::new(),
                 written_messages: HashMap::new(),
                 saved_projects: 0,
+                persisted_automations: HashSet::new(),
+                saved_automations: 0,
                 saved_app_settings: 0,
                 saved_app_state: 0,
             });
@@ -1272,6 +1337,8 @@ impl StateStore {
                 persisted_sessions: HashSet::new(),
                 written_messages: HashMap::new(),
                 saved_projects: 0,
+                persisted_automations: HashSet::new(),
+                saved_automations: 0,
                 saved_app_settings: 0,
                 saved_app_state: 0,
             });
@@ -1322,6 +1389,32 @@ impl StateStore {
                     .map_err(to_io_error)?;
             }
             storage.saved_projects = projects_fingerprint;
+        }
+
+        // Automations are few and always read whole, so a change to any one
+        // rewrites the small set rather than tracking per-automation dirtiness.
+        let (serialized_automations, automations_fingerprint) =
+            encode_automations(&state.automations)?;
+        let mut next_automation_state = None;
+        if automations_fingerprint != storage.saved_automations {
+            let current_ids = serialized_automations
+                .iter()
+                .map(|(id, _)| *id)
+                .collect::<HashSet<_>>();
+            for removed in storage.persisted_automations.difference(&current_ids) {
+                transaction
+                    .execute(
+                        "DELETE FROM automations WHERE id = ?1",
+                        params![removed.to_string()],
+                    )
+                    .map_err(to_io_error)?;
+            }
+            for (id, data) in &serialized_automations {
+                transaction
+                    .execute(UPSERT_AUTOMATION, params![id.to_string(), data])
+                    .map_err(to_io_error)?;
+            }
+            next_automation_state = Some((automations_fingerprint, current_ids));
         }
 
         // Only sessions the app reported as changed are written. A draft that
@@ -1404,6 +1497,10 @@ impl StateStore {
         }
 
         transaction.commit().map_err(to_io_error)?;
+        if let Some((fingerprint, ids)) = next_automation_state {
+            storage.saved_automations = fingerprint;
+            storage.persisted_automations = ids;
+        }
         // Now that the rows are durable, and not before.
         for (session_id, fingerprints) in written_messages {
             storage.written_messages.insert(session_id, fingerprints);
@@ -1466,6 +1563,7 @@ type SessionColumns = (
     String,
     Option<String>,
     String,
+    Option<String>,
     i64,
     i64,
     Option<i64>,
@@ -1485,6 +1583,7 @@ fn session_skeleton(row: SessionColumns) -> Option<AgentSession> {
         provider,
         model,
         status,
+        originating_automation,
         created_at,
         updated_at,
         last_reply_at,
@@ -1505,6 +1604,7 @@ fn session_skeleton(row: SessionColumns) -> Option<AgentSession> {
         context_window: None,
         agent_preset: None,
         status: serde_json::from_value(serde_json::Value::String(status)).ok()?,
+        originating_automation: originating_automation.and_then(|id| Uuid::parse_str(&id).ok()),
         created_at: created_at as u64,
         updated_at: updated_at as u64,
         last_reply_at: last_reply_at.map(|at| at as u64),
@@ -1715,18 +1815,23 @@ fn message_fingerprint(message: &Message, position: usize) -> u64 {
 /// listing sessions never has to deserialize a transcript.
 const UPSERT_SESSION: &str = "INSERT INTO sessions(
          id, project_id, title, auto_title, provider, model, status,
-         created_at, updated_at, last_reply_at
-     ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+         originating_automation, created_at, updated_at, last_reply_at
+     ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
      ON CONFLICT(id) DO UPDATE SET
-         project_id    = excluded.project_id,
-         title         = excluded.title,
-         auto_title    = excluded.auto_title,
-         provider      = excluded.provider,
-         model         = excluded.model,
-         status        = excluded.status,
-         created_at    = excluded.created_at,
-         updated_at    = excluded.updated_at,
-         last_reply_at = excluded.last_reply_at";
+         project_id             = excluded.project_id,
+         title                  = excluded.title,
+         auto_title             = excluded.auto_title,
+         provider               = excluded.provider,
+         model                  = excluded.model,
+         status                 = excluded.status,
+         originating_automation = excluded.originating_automation,
+         created_at             = excluded.created_at,
+         updated_at             = excluded.updated_at,
+         last_reply_at          = excluded.last_reply_at";
+
+const UPSERT_AUTOMATION: &str = "INSERT INTO automations(id, data)
+     VALUES(?1, ?2)
+     ON CONFLICT(id) DO UPDATE SET data = excluded.data";
 
 const INSERT_PROJECT: &str = "INSERT INTO projects(id, name, path, position, created_at)
      VALUES(?1, ?2, ?3, ?4, ?5)
@@ -1760,6 +1865,9 @@ fn session_params(session: &AgentSession) -> Vec<rusqlite::types::Value> {
         Value::Text(tag_of(session.provider)),
         session.model.clone().map_or(Value::Null, Value::Text),
         Value::Text(tag_of(session.status)),
+        session
+            .originating_automation
+            .map_or(Value::Null, |id| Value::Text(id.to_string())),
         Value::Integer(session.created_at as i64),
         Value::Integer(session.updated_at as i64),
         session
@@ -1810,6 +1918,317 @@ mod tests {
             text: text.to_owned(),
             attachments: Vec::new(),
         }
+    }
+
+    #[test]
+    fn a_full_automation_round_trips_and_history_is_capped() {
+        use crate::automation::{
+            Automation, AutomationRun, MAX_HISTORY, NotificationConfig, NotificationTrigger,
+            OverlapPolicy, Schedule, TimeOfDay, Weekday,
+        };
+
+        let directory = temporary_directory();
+        let store = store_in(&directory);
+        let mut state = PersistedState::fresh(PathBuf::from("/tmp/project"));
+        let project_id = state.projects[0].id;
+
+        // Exercise every field: a bound project, a fresh-worktree workspace, a
+        // non-default weekly schedule, a queue overlap policy, and an
+        // always-notify config.
+        let mut automation = Automation::new("Nightly triage", ProviderKind::Claude, 1_000);
+        automation.prompt = "Triage new issues".to_owned();
+        automation.project_id = Some(project_id);
+        automation.workspace = SessionWorkspace::NewWorktree {
+            base_branch: Some("main".to_owned()),
+        };
+        automation.agent.model = Some("claude-opus-4-8".to_owned());
+        automation.agent.reasoning_effort = Some("high".to_owned());
+        automation.agent.runtime_mode = RuntimeMode::Ask;
+        automation.schedule = Schedule::Weekly {
+            time: TimeOfDay::new(8, 30),
+            weekdays: vec![Weekday::Monday, Weekday::Friday],
+        };
+        automation.overlap = OverlapPolicy::Queue;
+        automation.notification = NotificationConfig {
+            enabled: true,
+            trigger: NotificationTrigger::Always,
+        };
+        automation.last_run_at = Some(2_000);
+
+        // Push more history than the bound; the oldest entries must drop.
+        for index in 0..(MAX_HISTORY as u64 + 5) {
+            automation.record_run(AutomationRun::skipped(3_000 + index, index % 2 == 0));
+        }
+        let automation_id = automation.id;
+        let expected = automation.clone();
+        state.automations.push(automation);
+        store.save(&mut state).unwrap();
+
+        // Reopen from disk to prove durability.
+        let restored = store_in(&directory).load().unwrap();
+        assert_eq!(restored.automations.len(), 1);
+        let loaded = restored
+            .automations
+            .iter()
+            .find(|automation| automation.id == automation_id)
+            .unwrap();
+        assert_eq!(loaded.history.len(), MAX_HISTORY);
+        assert_eq!(loaded, &expected);
+        // Newest-first survived the round trip.
+        assert_eq!(
+            loaded.history.first().unwrap().at,
+            3_000 + MAX_HISTORY as u64 + 4
+        );
+
+        fs::remove_dir_all(directory).ok();
+    }
+
+    #[test]
+    fn deleting_an_automation_removes_its_row() {
+        use crate::automation::Automation;
+
+        let directory = temporary_directory();
+        let store = store_in(&directory);
+        let mut state = PersistedState::fresh(PathBuf::from("/tmp/project"));
+        let keep = Automation::new("Keep", ProviderKind::Codex, 1_000);
+        let drop = Automation::new("Drop", ProviderKind::Codex, 1_000);
+        let keep_id = keep.id;
+        let drop_id = drop.id;
+        state.automations.push(keep);
+        state.automations.push(drop);
+        store.save(&mut state).unwrap();
+
+        state
+            .automations
+            .retain(|automation| automation.id != drop_id);
+        store.save(&mut state).unwrap();
+
+        let restored = store_in(&directory).load().unwrap();
+        assert_eq!(restored.automations.len(), 1);
+        assert!(
+            restored
+                .automations
+                .iter()
+                .any(|automation| automation.id == keep_id)
+        );
+        assert!(
+            !restored
+                .automations
+                .iter()
+                .any(|automation| automation.id == drop_id)
+        );
+
+        fs::remove_dir_all(directory).ok();
+    }
+
+    #[test]
+    fn saving_unchanged_automations_after_a_load_writes_nothing() {
+        use crate::automation::Automation;
+
+        for populated in [false, true] {
+            let directory = temporary_directory();
+            let store = store_in(&directory);
+            let mut state = PersistedState::fresh(PathBuf::from("/tmp/project"));
+            if populated {
+                state
+                    .automations
+                    .push(Automation::new("Nightly", ProviderKind::Codex, 1_000));
+                state
+                    .automations
+                    .push(Automation::new("Weekly", ProviderKind::Codex, 1_000));
+            }
+            store.save(&mut state).unwrap();
+            drop(store);
+
+            // A fresh open seeds the saved fingerprint from the rows it just
+            // read. Seeding it with a different encoding than the save path
+            // computes makes the two permanently unequal, so every first save
+            // after a load rewrites the whole table for no reason.
+            let reopened = store_in(&directory);
+            let mut loaded = reopened.load().unwrap();
+            assert_eq!(loaded.automations.len(), if populated { 2 } else { 0 });
+            reopened
+                .storage
+                .lock()
+                .as_ref()
+                .unwrap()
+                .connection
+                .execute_batch(
+                    "CREATE TRIGGER fail_automation_insert BEFORE INSERT ON automations
+                         BEGIN SELECT RAISE(FAIL, 'unexpected automation write'); END;
+                     CREATE TRIGGER fail_automation_update BEFORE UPDATE ON automations
+                         BEGIN SELECT RAISE(FAIL, 'unexpected automation write'); END;
+                     CREATE TRIGGER fail_automation_delete BEFORE DELETE ON automations
+                         BEGIN SELECT RAISE(FAIL, 'unexpected automation write'); END;",
+                )
+                .unwrap();
+            reopened.save(&mut loaded).unwrap();
+
+            fs::remove_dir_all(directory).ok();
+        }
+    }
+
+    #[test]
+    fn undecodable_automation_rows_survive_updates_and_known_deletions() {
+        use crate::automation::Automation;
+
+        let directory = temporary_directory();
+        let store = store_in(&directory);
+        let mut state = PersistedState::fresh(PathBuf::from("/tmp/project"));
+        let automation = Automation::new("Known", ProviderKind::Codex, 1_000);
+        let known_id = automation.id;
+        state.automations.push(automation);
+        store.save(&mut state).unwrap();
+
+        let unknown_id = Uuid::new_v4();
+        store
+            .storage
+            .lock()
+            .as_ref()
+            .unwrap()
+            .connection
+            .execute(
+                "INSERT INTO automations(id, data) VALUES(?1, ?2)",
+                params![unknown_id.to_string(), "{not-json"],
+            )
+            .unwrap();
+
+        let reopened = store_in(&directory);
+        let mut loaded = reopened.load().unwrap();
+        loaded
+            .automations
+            .iter_mut()
+            .find(|automation| automation.id == known_id)
+            .unwrap()
+            .name = "Updated".to_owned();
+        reopened.save(&mut loaded).unwrap();
+        loaded
+            .automations
+            .retain(|automation| automation.id != known_id);
+        reopened.save(&mut loaded).unwrap();
+
+        let storage = reopened.storage.lock();
+        let connection = &storage.as_ref().unwrap().connection;
+        let rows = connection
+            .query_row("SELECT COUNT(*) FROM automations", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        let unknown = connection
+            .query_row(
+                "SELECT data FROM automations WHERE id = ?1",
+                params![unknown_id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 1);
+        assert_eq!(unknown, "{not-json");
+
+        fs::remove_dir_all(directory).ok();
+    }
+
+    #[test]
+    fn failed_transaction_retries_automation_edit_and_deletion() {
+        use crate::automation::Automation;
+
+        for delete in [false, true] {
+            let directory = temporary_directory();
+            let store = store_in(&directory);
+            let mut state = PersistedState::fresh(PathBuf::from("/tmp/project"));
+            let automation = Automation::new("Before", ProviderKind::Codex, 1_000);
+            let automation_id = automation.id;
+            state.automations.push(automation);
+            let session_id = state.sessions[0].id;
+            state.session_mut(session_id).unwrap().begin_turn("initial");
+            store.save(&mut state).unwrap();
+
+            if delete {
+                state
+                    .automations
+                    .retain(|automation| automation.id != automation_id);
+            } else {
+                state
+                    .automations
+                    .iter_mut()
+                    .find(|automation| automation.id == automation_id)
+                    .unwrap()
+                    .name = "After".to_owned();
+            }
+            state.session_mut(session_id).unwrap().title = "force session write".to_owned();
+            {
+                let guard = store.storage.lock();
+                guard
+                    .as_ref()
+                    .unwrap()
+                    .connection
+                    .execute_batch(
+                        "CREATE TRIGGER fail_session_update BEFORE UPDATE ON sessions BEGIN SELECT RAISE(FAIL, 'injected'); END;",
+                    )
+                    .unwrap();
+            }
+            assert!(store.save(&mut state).is_err());
+            store
+                .storage
+                .lock()
+                .as_ref()
+                .unwrap()
+                .connection
+                .execute_batch("DROP TRIGGER fail_session_update")
+                .unwrap();
+            store.save(&mut state).unwrap();
+
+            let restored = store_in(&directory).load().unwrap();
+            if delete {
+                assert!(
+                    !restored
+                        .automations
+                        .iter()
+                        .any(|automation| automation.id == automation_id)
+                );
+            } else {
+                assert_eq!(
+                    restored
+                        .automations
+                        .iter()
+                        .find(|automation| automation.id == automation_id)
+                        .unwrap()
+                        .name,
+                    "After"
+                );
+            }
+            fs::remove_dir_all(directory).ok();
+        }
+    }
+
+    #[test]
+    fn a_sessions_originating_automation_round_trips_as_a_column() {
+        let directory = temporary_directory();
+        let store = store_in(&directory);
+        let mut state = PersistedState::fresh(PathBuf::from("/tmp/project"));
+        let automation_id = Uuid::new_v4();
+
+        // A started session so it is actually persisted, tagged with its origin.
+        let session_id = state.sessions[0].id;
+        {
+            let session = state.session_mut(session_id).unwrap();
+            session.originating_automation = Some(automation_id);
+            session.begin_turn("Run the automation");
+            session.finish_active_turn(crate::model::TurnStatus::Completed);
+        }
+        store.save(&mut state).unwrap();
+
+        // The origin is read from the promoted column into the list skeleton,
+        // without hydrating the transcript.
+        let restored = store_in(&directory).load().unwrap();
+        let session = restored
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+            .unwrap();
+        assert!(!session.detail_loaded, "list load returns a skeleton");
+        assert_eq!(session.originating_automation, Some(automation_id));
+
+        fs::remove_dir_all(directory).ok();
     }
 
     #[test]
@@ -2513,11 +2932,7 @@ mod tests {
         assert_eq!(restored.sessions[0].context_window.as_deref(), Some("1m"));
         assert_eq!(
             restored.model_traits_for(ProviderKind::Codex, "gpt-5.6-luna"),
-            (
-                Some("xhigh".into()),
-                Some("fast".into()),
-                Some("1m".into())
-            )
+            (Some("xhigh".into()), Some("fast".into()), Some("1m".into()))
         );
         assert_eq!(
             restored.sessions[0].runtime_mode,
