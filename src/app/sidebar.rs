@@ -163,6 +163,70 @@ const SIDEBAR_SESSION_CARD_HEIGHT: f32 = 51.0;
 const SIDEBAR_SESSION_ROW_GAP: f32 = 1.0;
 const SIDEBAR_SESSION_ROW_HEIGHT: f32 = SIDEBAR_SESSION_CARD_HEIGHT + SIDEBAR_SESSION_ROW_GAP;
 const SIDEBAR_ACTION_ROW_HEIGHT: f32 = 32.0;
+/// How many of an expanded automation's runs show before the rest fold behind a
+/// "Show more" toggle.
+const AUTOMATION_RUN_PREVIEW: usize = 3;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct AutomationSidebarMetadata {
+    name: Option<String>,
+    enabled: bool,
+    time_label: Option<String>,
+    running_status: Option<SessionStatus>,
+    owns_selection: bool,
+    run_count: usize,
+}
+
+impl Default for AutomationSidebarMetadata {
+    fn default() -> Self {
+        Self {
+            name: None,
+            enabled: true,
+            time_label: None,
+            running_status: None,
+            owns_selection: false,
+            run_count: 0,
+        }
+    }
+}
+
+fn automation_sidebar_metadata<'a>(
+    sessions: impl IntoIterator<Item = &'a AgentSession>,
+    automations: impl IntoIterator<Item = &'a crate::automation::Automation>,
+    selected_session: Option<Uuid>,
+    now: u64,
+) -> HashMap<Uuid, AutomationSidebarMetadata> {
+    let mut metadata: HashMap<Uuid, AutomationSidebarMetadata> = HashMap::new();
+    for session in sessions {
+        let Some(automation_id) = session.originating_automation else {
+            continue;
+        };
+        let entry = metadata.entry(automation_id).or_default();
+        entry.run_count += 1;
+        entry.owns_selection |= selected_session == Some(session.id);
+        if entry.running_status.is_none()
+            && matches!(
+                session.status,
+                SessionStatus::Connecting | SessionStatus::Working
+            )
+        {
+            entry.running_status = Some(session.status);
+            entry.time_label = session_time_label(session, now);
+        } else if entry.running_status.is_none() && entry.time_label.is_none() {
+            // Sessions arrive newest first, so the first idle session supplies
+            // the same recency label as the former `latest_run` timestamp.
+            entry.time_label = Some(format_time_ago(
+                now.saturating_sub(sidebar_session_timestamp(session)),
+            ));
+        }
+    }
+    for automation in automations {
+        let entry = metadata.entry(automation.id).or_default();
+        entry.name = Some(automation.name.clone());
+        entry.enabled = automation.enabled;
+    }
+    metadata
+}
 const SIDEBAR_SEARCH_BOTTOM_GAP: f32 = 10.0;
 
 /// The session row's trailing time: how long the live turn has been working,
@@ -192,6 +256,19 @@ fn sidebar_session_timestamp(session: &AgentSession) -> u64 {
     session.last_reply_at.unwrap_or(session.created_at)
 }
 
+/// Absolute local date and time for an automation run row, e.g.
+/// "Aug 14 · 3:25 PM". Runs share the prompt as their title, so the time is
+/// what distinguishes them under the group.
+fn format_run_timestamp(unix: u64) -> String {
+    DateTime::<Utc>::from_timestamp(unix as i64, 0)
+        .map(|when| {
+            when.with_timezone(&Local)
+                .format("%b %-d · %-I:%M %p")
+                .to_string()
+        })
+        .unwrap_or_default()
+}
+
 /// Compact "how long ago" for the sidebar: "just now", then one coarse unit —
 /// "5m", "3h", "420d". Days are the largest unit so a glance still reads as a
 /// count rather than a date.
@@ -209,12 +286,38 @@ pub(super) fn format_time_ago(seconds: u64) -> String {
 pub(super) enum SidebarRow {
     /// Opens the window-wide command palette and scrolls with history.
     Search,
-    /// Date-group header; the first row also carries the project action.
+    /// Collapsible header for the automation-spawned conversations section,
+    /// pinned above the date groups so automation runs do not bloat them.
+    AutomationsHeader,
+    /// A collapsible group for one automation's runs, labeled with the
+    /// automation's name. Its runs render as `AutomationRun` rows when expanded.
+    AutomationGroup(Uuid),
+    /// One run under an expanded `AutomationGroup`: the same session row as
+    /// `Session`, indented so it reads as nested under the automation name.
+    AutomationRun(Uuid),
+    /// Toggle below an expanded group with more than the preview count of runs:
+    /// reveals the remaining runs or collapses back to the preview.
+    AutomationRunsToggle(Uuid),
+    /// Date-group header; the first date header also carries the project action.
     Header(SessionDateGroup),
     /// A started session.
     Session(Uuid),
     /// Spacing between date groups.
     GroupSpacer,
+}
+
+pub(super) struct SidebarRows {
+    rows: Vec<SidebarRow>,
+    first_date_header: Option<usize>,
+}
+
+impl Default for SidebarRows {
+    fn default() -> Self {
+        Self {
+            rows: Vec::new(),
+            first_date_header: None,
+        }
+    }
 }
 
 impl Waku {
@@ -420,6 +523,7 @@ impl Waku {
         id: &'static str,
         icon_path: &'static str,
         label: String,
+        selected: bool,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         let theme = Theme::current(cx);
@@ -436,6 +540,9 @@ impl Waku {
             .gap(px(10.0))
             .cursor_default()
             .focus_visible(|style| style.border_1().border_color(theme.accent))
+            .when(selected, |element| {
+                element.bg(theme.sidebar_item_background)
+            })
             .hover(|element| element.bg(theme.sidebar_item_background))
             .active(|element| element.bg(theme.overlay_strong))
             .child(
@@ -462,6 +569,7 @@ impl Waku {
             "sidebar-new-session",
             "icons/compose.svg",
             tr!("menu.new_task"),
+            false,
             cx,
         )
         .on_click(cx.listener(|this, _, window, cx| {
@@ -475,12 +583,32 @@ impl Waku {
         }))
     }
 
+    fn render_sidebar_automations(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        self.render_sidebar_action_row(
+            "sidebar-automations",
+            "icons/zap.svg",
+            tr!("sidebar.automations"),
+            matches!(self.active_page.as_ref(), Some(ActivePage::Automations(_))),
+            cx,
+        )
+        .on_click(cx.listener(|this, _, window, cx| {
+            this.open_automations(window, cx);
+        }))
+        .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+            if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                this.open_automations(window, cx);
+                cx.stop_propagation();
+            }
+        }))
+    }
+
     fn render_sidebar_search(&self, cx: &mut Context<Self>) -> Div {
         let search = self
             .render_sidebar_action_row(
                 "sidebar-search",
                 "icons/search.svg",
                 tr!("sidebar.search"),
+                false,
                 cx,
             )
             .on_click(cx.listener(|this, _, window, cx| {
@@ -673,7 +801,7 @@ impl Waku {
             .is_some_and(|drag| drag.target == PanelResizeTarget::Sidebar);
 
         let rows = self.sidebar_rows_cached(Local::now().date_naive());
-        self.sync_sidebar_rows(&rows);
+        self.sync_sidebar_rows(&rows.rows);
         let history_scrolled =
             self.sidebar_list_state.scroll_px_offset_for_scrollbar().y < px(-0.5);
         let entity = cx.entity().downgrade();
@@ -698,6 +826,12 @@ impl Waku {
             )
             .child(
                 div()
+                    .flex_none()
+                    .px(px(10.0))
+                    .child(self.render_sidebar_automations(cx)),
+            )
+            .child(
+                div()
                     .id("sidebar-scroll")
                     .flex_1()
                     .min_h_0()
@@ -711,7 +845,12 @@ impl Waku {
                                         .upgrade()
                                         .map(|entity| {
                                             entity.update(cx, |this, cx| {
-                                                this.sidebar_row(index, &rows, cx)
+                                                this.sidebar_row(
+                                                    index,
+                                                    &rows.rows,
+                                                    rows.first_date_header,
+                                                    cx,
+                                                )
                                             })
                                         })
                                         .unwrap_or_else(|| div().into_any_element())
@@ -746,27 +885,17 @@ impl Waku {
     /// started session and runs calendar math per session — far too much per
     /// tick for values that move at most once per stream commit. The
     /// fingerprint is an allocation-free scan of exactly what
-    /// [`Self::sidebar_rows`] reads: started sessions in order with their
-    /// recency timestamps, the collapsed-group set, and today's date.
-    fn sidebar_rows_cached(&self, today: NaiveDate) -> Rc<Vec<SidebarRow>> {
-        let mut fingerprint = mix(0x51de_ba5e_5eed_c0de, today.num_days_from_ce() as u64);
-        for session in &self.state.sessions {
-            if !session.has_started() {
-                continue;
-            }
-            fingerprint = mix_uuid(fingerprint, session.id);
-            fingerprint = mix(fingerprint, sidebar_session_timestamp(session));
-        }
-        // A set has no stable iteration order; combine order-independently.
-        let collapsed = self
-            .sidebar_collapsed_groups
-            .iter()
-            .fold(0u64, |combined, group| {
-                combined.wrapping_add(mix(0, group.index() as u64 + 1))
-            });
-        fingerprint = mix(
-            mix(fingerprint, self.sidebar_collapsed_groups.len() as u64),
-            collapsed,
+    /// [`Self::sidebar_rows`] reads.
+    fn sidebar_rows_cached(&self, today: NaiveDate) -> Rc<SidebarRows> {
+        let fingerprint = sidebar_rows_fingerprint(
+            &self.state.sessions,
+            &self.state.automations,
+            self.state.selected_session,
+            today,
+            &self.sidebar_collapsed_groups,
+            self.sidebar_automations_collapsed,
+            &self.sidebar_expanded_automations,
+            &self.sidebar_expanded_automation_runs,
         );
         if self.sidebar_rows_fingerprint.get() != Some(fingerprint) {
             *self.sidebar_rows_snapshot.borrow_mut() = Rc::new(self.sidebar_rows(today));
@@ -777,8 +906,15 @@ impl Waku {
 
     /// Snapshot the session history as a flat list of lightweight rows, newest
     /// first, grouped by calendar period like the previous eager render.
-    fn sidebar_rows(&self, today: NaiveDate) -> Vec<SidebarRow> {
+    fn sidebar_rows(&self, today: NaiveDate) -> SidebarRows {
         let mut grouped_sessions: [Vec<Uuid>; 6] = std::array::from_fn(|_| Vec::new());
+        // Automation runs fold under one collapsible section, and within it
+        // under a per-automation group named after the automation, so a busy
+        // automation is a single row rather than a run per line. Groups keep
+        // first-seen order (most recent run first) since sessions are sorted by
+        // recency below.
+        let mut automation_group_index: HashMap<Uuid, usize> = HashMap::new();
+        let mut automation_groups: Vec<(Uuid, Vec<Uuid>)> = Vec::new();
         let mut sorted_sessions = self
             .state
             .sessions
@@ -787,14 +923,65 @@ impl Waku {
             .collect::<Vec<_>>();
         sorted_sessions
             .sort_by_key(|session| std::cmp::Reverse(sidebar_session_timestamp(session)));
+        *self.sidebar_automation_metadata.borrow_mut() = automation_sidebar_metadata(
+            sorted_sessions.iter().copied(),
+            self.state.automations.iter(),
+            self.state.selected_session,
+            unix_time(),
+        );
         for session in sorted_sessions {
+            if let Some(automation_id) = session.originating_automation {
+                match automation_group_index.get(&automation_id) {
+                    Some(&index) => automation_groups[index].1.push(session.id),
+                    None => {
+                        automation_group_index.insert(automation_id, automation_groups.len());
+                        automation_groups.push((automation_id, vec![session.id]));
+                    }
+                }
+                continue;
+            }
             grouped_sessions[session_date_group(sidebar_session_timestamp(session), today).index()]
                 .push(session.id);
         }
 
         let mut rows = vec![SidebarRow::Search];
+        if !automation_groups.is_empty() {
+            rows.push(SidebarRow::AutomationsHeader);
+            if !self.sidebar_automations_collapsed {
+                for (automation_id, session_ids) in automation_groups {
+                    rows.push(SidebarRow::AutomationGroup(automation_id));
+                    if self.sidebar_expanded_automations.contains(&automation_id) {
+                        // Preview only the most recent runs; the rest hide behind
+                        // a toggle so a busy automation does not flood the sidebar.
+                        let show_all = self
+                            .sidebar_expanded_automation_runs
+                            .contains(&automation_id);
+                        let visible = if show_all {
+                            session_ids.len()
+                        } else {
+                            session_ids.len().min(AUTOMATION_RUN_PREVIEW)
+                        };
+                        rows.extend(
+                            session_ids[..visible]
+                                .iter()
+                                .copied()
+                                .map(SidebarRow::AutomationRun),
+                        );
+                        if session_ids.len() > AUTOMATION_RUN_PREVIEW {
+                            rows.push(SidebarRow::AutomationRunsToggle(automation_id));
+                        }
+                    }
+                }
+            }
+            rows.push(SidebarRow::GroupSpacer);
+        }
+        let has_date_sessions = grouped_sessions.iter().any(|group| !group.is_empty());
+        let mut first_date_header = None;
         for group in SessionDateGroup::ALL {
             let group_sessions = &grouped_sessions[group.index()];
+            if !group_sessions.is_empty() && first_date_header.is_none() {
+                first_date_header = Some(rows.len());
+            }
             append_sidebar_group_rows(
                 &mut rows,
                 group,
@@ -802,11 +989,16 @@ impl Waku {
                 self.sidebar_collapsed_groups.contains(&group),
             );
         }
-        if rows.len() == 1 {
-            // Keep the project action visible while there is no history.
+        if !has_date_sessions {
+            // Keep the project action visible while there is no manual history,
+            // even when automation runs already occupy the sidebar above.
+            first_date_header = Some(rows.len());
             rows.push(SidebarRow::Header(SessionDateGroup::Today));
         }
-        rows
+        SidebarRows {
+            rows,
+            first_date_header,
+        }
     }
 
     /// Keep the virtualized list in sync with the current row snapshot.
@@ -839,17 +1031,36 @@ impl Waku {
         }
     }
 
-    fn sidebar_row(&self, index: usize, rows: &[SidebarRow], cx: &mut Context<Self>) -> AnyElement {
+    fn sidebar_row(
+        &self,
+        index: usize,
+        rows: &[SidebarRow],
+        first_date_header: Option<usize>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let Some(row) = rows.get(index) else {
             return div().into_any_element();
         };
         match *row {
             SidebarRow::Search => self.render_sidebar_search(cx).into_any_element(),
+            SidebarRow::AutomationsHeader => self
+                .render_sidebar_automations_header(cx)
+                .into_any_element(),
+            SidebarRow::AutomationGroup(automation_id) => {
+                self.render_sidebar_automation_group(automation_id, cx)
+            }
+            SidebarRow::AutomationRun(session_id) => div()
+                .pl(px(16.0))
+                .child(self.render_sidebar_session_item(session_id, true, cx))
+                .into_any_element(),
+            SidebarRow::AutomationRunsToggle(automation_id) => {
+                self.render_sidebar_automation_runs_toggle(automation_id, cx)
+            }
             SidebarRow::Header(group) => self
-                .render_sidebar_group_header(group, index == 1, cx)
+                .render_sidebar_group_header(group, first_date_header == Some(index), cx)
                 .into_any_element(),
             SidebarRow::Session(session_id) => self
-                .render_sidebar_session_item(session_id, cx)
+                .render_sidebar_session_item(session_id, false, cx)
                 .into_any_element(),
             SidebarRow::GroupSpacer => div().w_full().h(px(10.0)).into_any_element(),
         }
@@ -939,6 +1150,381 @@ impl Waku {
         }
     }
 
+    fn render_sidebar_automations_header(&self, cx: &mut Context<Self>) -> Div {
+        let theme = Theme::current(cx);
+        let collapsed = self.sidebar_automations_collapsed;
+        let group_name = SharedString::from("sidebar-automations-group-header");
+        let chevron = icon("icons/chevron-down.svg", 11.0, theme.text_ghost)
+            .when(collapsed, |icon| {
+                icon.with_transformation(gpui::Transformation::rotate(gpui::percentage(0.75)))
+            })
+            .invisible()
+            .group_hover(group_name.clone(), |icon| icon.visible());
+
+        session_group_header(&theme)
+            .group(group_name)
+            .w_full()
+            .child(
+                div()
+                    .id("sidebar-automations-group-toggle")
+                    .tab_index(0)
+                    .h(px(22.0))
+                    .rounded(px(4.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(5.0))
+                    .cursor_default()
+                    .focus_visible(|style| style.border_1().border_color(theme.accent))
+                    .child(tr!("sidebar.automations"))
+                    .child(chevron)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.toggle_sidebar_automations(cx);
+                    }))
+                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                        match event.keystroke.key.as_str() {
+                            "enter" | "space" => {
+                                this.toggle_sidebar_automations(cx);
+                                cx.stop_propagation();
+                            }
+                            "left" if !this.sidebar_automations_collapsed => {
+                                this.set_sidebar_automations_collapsed(true, cx);
+                                cx.stop_propagation();
+                            }
+                            "right" if this.sidebar_automations_collapsed => {
+                                this.set_sidebar_automations_collapsed(false, cx);
+                                cx.stop_propagation();
+                            }
+                            _ => {}
+                        }
+                    })),
+            )
+    }
+
+    fn toggle_sidebar_automations(&mut self, cx: &mut Context<Self>) {
+        self.set_sidebar_automations_collapsed(!self.sidebar_automations_collapsed, cx);
+    }
+
+    fn set_sidebar_automations_collapsed(&mut self, collapsed: bool, cx: &mut Context<Self>) {
+        if self.sidebar_automations_collapsed != collapsed {
+            self.sidebar_automations_collapsed = collapsed;
+            cx.notify();
+        }
+    }
+
+    /// Whether a specific automation has a run connecting or working right now.
+    /// One automation's collapsible run group: its name, the time since its
+    /// most recent run, and a chevron. Collapsed by default; expanding reveals
+    /// its runs. Falls back to a generic label if the automation was deleted.
+    fn render_sidebar_automation_group(
+        &self,
+        automation_id: Uuid,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = Theme::current(cx);
+        let expanded = self.sidebar_expanded_automations.contains(&automation_id);
+        let metadata = self
+            .sidebar_automation_metadata
+            .borrow()
+            .get(&automation_id)
+            .cloned()
+            .unwrap_or_default();
+        let name = metadata
+            .name
+            .clone()
+            .unwrap_or_else(|| tr!("sidebar.automation_deleted"));
+        // A disabled automation reads muted, paired with a block glyph so the
+        // state is not carried by color alone.
+        let enabled = metadata.enabled;
+        // A currently-working run turns the trailing metadata into the same
+        // spinner + "Working…" treatment the run rows use. The finished label
+        // is prepared with the session row's shared time-label routine while
+        // the snapshot is built.
+        // When collapsed, mirror the selected run so the active automation reads
+        // as selected without expanding. The Automations page owns the
+        // highlight while it is open, so defer to it as session rows do.
+        let owns_selection = !matches!(self.active_page.as_ref(), Some(ActivePage::Automations(_)))
+            && metadata.owns_selection;
+        let highlight = owns_selection && !expanded;
+
+        // Reveal the chevron only on hover, matching the section headers.
+        let group_name = SharedString::from(format!("automation-group-hover-{automation_id}"));
+        let chevron = icon("icons/chevron-down.svg", 11.0, theme.text_ghost)
+            .when(!expanded, |icon| {
+                icon.with_transformation(gpui::Transformation::rotate(gpui::percentage(0.75)))
+            })
+            .invisible()
+            .group_hover(group_name.clone(), |icon| icon.visible());
+
+        // The right-hand metadata. Expanding the group reveals the runs below,
+        // whose first row already carries this, so drop it to avoid a duplicate.
+        let trailing = if expanded {
+            None
+        } else if let Some(status) = metadata.running_status {
+            Some(
+                div()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap(px(4.0))
+                    .child(
+                        icon(
+                            "icons/loader-circle.svg",
+                            12.0,
+                            status_color(&theme, status),
+                        )
+                        .with_animation(
+                            SharedString::from(format!("automation-group-spinner-{automation_id}")),
+                            Animation::new(Duration::from_millis(900))
+                                .repeat()
+                                .with_easing(gpui::linear),
+                            |icon, delta| {
+                                icon.with_transformation(gpui::Transformation::rotate(
+                                    gpui::percentage(delta),
+                                ))
+                            },
+                        ),
+                    )
+                    .when_some(metadata.time_label.clone(), |element, label| {
+                        element.child(
+                            div()
+                                .text_size(px(11.0))
+                                .text_color(theme.text_ghost)
+                                .child(SharedString::from(label)),
+                        )
+                    })
+                    .into_any_element(),
+            )
+        } else if !enabled {
+            // Disabled: a pause glyph replaces the time so the muted row still
+            // states its status without relying on color.
+            Some(icon("icons/pause.svg", 11.0, theme.text_tertiary).into_any_element())
+        } else {
+            metadata.time_label.map(|label| {
+                div()
+                    .flex_none()
+                    .text_size(px(11.0))
+                    .text_color(theme.text_ghost)
+                    .child(SharedString::from(label))
+                    .into_any_element()
+            })
+        };
+
+        let waku = cx.entity().downgrade();
+        let menu = self.menu_handle(format!("automation-menu-{automation_id}"), cx);
+        let keyboard_menu = menu.clone();
+
+        let row = div()
+            .id(SharedString::from(format!(
+                "automation-group-{automation_id}"
+            )))
+            .group(group_name)
+            .tab_index(0)
+            .w_full()
+            .min_w_0()
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .px(px(8.0))
+            .py(px(7.0))
+            .rounded(px(7.0))
+            .cursor_default()
+            .focus_visible(|style| style.border_1().border_color(theme.accent))
+            .when(highlight, |element| {
+                element.bg(theme.sidebar_item_background)
+            })
+            .hover(|element| element.bg(theme.sidebar_item_background))
+            .child(
+                // Name + chevron form the left cluster so the chevron sits just
+                // right of the (truncating) name rather than pinned far right.
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .whitespace_normal()
+                            .line_clamp(1)
+                            .text_overflow(gpui::TextOverflow::Truncate("...".into()))
+                            .text_size(px(13.5))
+                            .text_color(if enabled {
+                                theme.text
+                            } else {
+                                theme.text_tertiary
+                            })
+                            .child(SharedString::from(name)),
+                    )
+                    .child(chevron),
+            )
+            .when_some(trailing, |element, trailing| element.child(trailing))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.toggle_sidebar_automation(automation_id, cx);
+            }))
+            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
+                match event.keystroke.key.as_str() {
+                    "enter" | "space" => {
+                        this.toggle_sidebar_automation(automation_id, cx);
+                        cx.stop_propagation();
+                    }
+                    "left" if this.sidebar_expanded_automations.contains(&automation_id) => {
+                        this.set_sidebar_automation_expanded(automation_id, false, cx);
+                        cx.stop_propagation();
+                    }
+                    "right" if !this.sidebar_expanded_automations.contains(&automation_id) => {
+                        this.set_sidebar_automation_expanded(automation_id, true, cx);
+                        cx.stop_propagation();
+                    }
+                    "f10" if event.keystroke.modifiers.shift => {
+                        keyboard_menu.open_context_menu(window, cx);
+                        cx.stop_propagation();
+                    }
+                    _ => {}
+                }
+            }));
+
+        // Right-click (or Shift+F10) to run now, edit, or toggle enabled.
+        // The bottom gap separates the group row from its runs, matching the
+        // spacing between the run rows themselves.
+        context_menu(
+            div().w_full().pb(px(SIDEBAR_SESSION_ROW_GAP)).child(row),
+            SharedString::from(format!("automation-menu-{automation_id}")),
+            &menu,
+            move |_| {
+                let run_waku = waku.clone();
+                let edit_waku = waku.clone();
+                let toggle_waku = waku.clone();
+                vec![
+                    MenuItem::new(tr!("automations.run_now"), move |_, cx| {
+                        let _ = run_waku.update(cx, |waku, cx| {
+                            waku.run_automation_now(automation_id, cx);
+                        });
+                    }),
+                    MenuItem::new(tr!("automations.edit"), move |window, cx| {
+                        let _ = edit_waku.update(cx, |waku, cx| {
+                            waku.open_automation_editor(Some(automation_id), window, cx);
+                        });
+                    }),
+                    MenuItem::Separator,
+                    MenuItem::new(
+                        if enabled {
+                            tr!("automations.menu_disable")
+                        } else {
+                            tr!("automations.menu_enable")
+                        },
+                        move |_, cx| {
+                            let _ = toggle_waku.update(cx, |waku, cx| {
+                                waku.toggle_automation_enabled(automation_id, cx);
+                            });
+                        },
+                    ),
+                ]
+            },
+        )
+    }
+
+    fn toggle_sidebar_automation(&mut self, automation_id: Uuid, cx: &mut Context<Self>) {
+        let expanded = self.sidebar_expanded_automations.contains(&automation_id);
+        self.set_sidebar_automation_expanded(automation_id, !expanded, cx);
+    }
+
+    fn set_sidebar_automation_expanded(
+        &mut self,
+        automation_id: Uuid,
+        expanded: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let changed = if expanded {
+            self.sidebar_expanded_automations.insert(automation_id)
+        } else {
+            self.sidebar_expanded_automations.remove(&automation_id)
+        };
+        if changed {
+            cx.notify();
+        }
+    }
+
+    /// The "Show more"/"Show less" row beneath an expanded group whose runs
+    /// exceed the preview. Indented under the runs and toggles the full list.
+    fn render_sidebar_automation_runs_toggle(
+        &self,
+        automation_id: Uuid,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = Theme::current(cx);
+        let expanded = self
+            .sidebar_expanded_automation_runs
+            .contains(&automation_id);
+        let total = self
+            .sidebar_automation_metadata
+            .borrow()
+            .get(&automation_id)
+            .map_or(0, |metadata| metadata.run_count);
+        let label = if expanded {
+            tr!("sidebar.show_fewer_runs")
+        } else {
+            tr!(
+                "sidebar.show_more_runs",
+                count = total.saturating_sub(AUTOMATION_RUN_PREVIEW)
+            )
+        };
+        let group_name =
+            SharedString::from(format!("automation-runs-toggle-hover-{automation_id}"));
+        // Down chevron reads as "reveal more"; flip it up once expanded.
+        let chevron = icon("icons/chevron-down.svg", 11.0, theme.text_ghost)
+            .when(expanded, |icon| {
+                icon.with_transformation(gpui::Transformation::rotate(gpui::percentage(0.5)))
+            })
+            .group_hover(group_name.clone(), |icon| {
+                icon.text_color(theme.text_secondary)
+            });
+
+        div()
+            .id(SharedString::from(format!(
+                "automation-runs-toggle-{automation_id}"
+            )))
+            .group(group_name.clone())
+            .tab_index(0)
+            .w_full()
+            .min_w_0()
+            .flex()
+            .items_center()
+            .gap(px(5.0))
+            .pl(px(24.0))
+            .pr(px(8.0))
+            .py(px(5.0))
+            .rounded(px(7.0))
+            .cursor_default()
+            .text_color(theme.text_ghost)
+            .focus_visible(|style| style.border_1().border_color(theme.accent))
+            .child(
+                div()
+                    .flex_none()
+                    .text_size(px(11.5))
+                    .group_hover(group_name, |label| label.text_color(theme.text_secondary))
+                    .child(SharedString::from(label)),
+            )
+            .child(chevron)
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.toggle_sidebar_automation_runs(automation_id, cx);
+            }))
+            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                    this.toggle_sidebar_automation_runs(automation_id, cx);
+                    cx.stop_propagation();
+                }
+            }))
+            .into_any_element()
+    }
+
+    fn toggle_sidebar_automation_runs(&mut self, automation_id: Uuid, cx: &mut Context<Self>) {
+        if !self.sidebar_expanded_automation_runs.remove(&automation_id) {
+            self.sidebar_expanded_automation_runs.insert(automation_id);
+        }
+        cx.notify();
+    }
+
     fn begin_session_rename(
         &mut self,
         session_id: Uuid,
@@ -1002,7 +1588,12 @@ impl Waku {
         cx.notify();
     }
 
-    fn render_sidebar_session_item(&self, session_id: Uuid, cx: &mut Context<Self>) -> AnyElement {
+    fn render_sidebar_session_item(
+        &self,
+        session_id: Uuid,
+        show_run_time: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let theme = Theme::current(cx);
         let Some(session) = self
             .state
@@ -1012,12 +1603,15 @@ impl Waku {
         else {
             return div().into_any_element();
         };
-        let selected = sidebar_session_selected(
-            self.state.selected_session,
-            self.pending_session_activation
-                .map(|pending| pending.session_id),
-            session_id,
-        );
+        // While the Automations page is open it owns the selection highlight, so
+        // the underlying selected session row does not also appear selected.
+        let selected = !matches!(self.active_page.as_ref(), Some(ActivePage::Automations(_)))
+            && sidebar_session_selected(
+                self.state.selected_session,
+                self.pending_session_activation
+                    .map(|pending| pending.session_id),
+                session_id,
+            );
         let working = matches!(
             session.status,
             SessionStatus::Connecting | SessionStatus::Working
@@ -1062,10 +1656,28 @@ impl Waku {
                 .whitespace_normal()
                 .line_clamp(1)
                 .text_overflow(gpui::TextOverflow::Truncate("...".into()))
-                .text_size(px(13.5))
-                .text_color(theme.text)
-                .child(SharedString::from(localized_session_title(session)))
+                // Automation runs all share the prompt as their title, so the
+                // run time is what tells them apart under the group. Style it
+                // like the folder subtitle — small and muted — since it reads
+                // more as metadata than a title.
+                .text_size(if show_run_time { px(11.5) } else { px(13.5) })
+                .text_color(if show_run_time {
+                    theme.text_tertiary
+                } else {
+                    theme.text
+                })
+                .child(SharedString::from(if show_run_time {
+                    format_run_timestamp(session.created_at)
+                } else {
+                    localized_session_title(session)
+                }))
                 .into_any_element()
+        };
+        let time_label = session_time_label(session, unix_time());
+        let time_label_color = if session.is_busy() {
+            theme.text_tertiary
+        } else {
+            theme.text_ghost
         };
         let waku = cx.entity().downgrade();
         let menu = self.menu_handle(format!("session-{session_id}"), cx);
@@ -1115,40 +1727,49 @@ impl Waku {
                             12.0,
                             status_color(&theme, session.status),
                         ))
-                    }),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(5.0))
-                    .text_size(px(11.5))
-                    .line_height(px(15.0))
-                    .child(icon("icons/folder.svg", 11.0, theme.text_tertiary))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_color(theme.text_tertiary)
-                            .child(SharedString::from(project_name)),
-                    )
-                    .when_some(
-                        session_time_label(session, unix_time()),
-                        |element, label| {
+                    })
+                    // Automation runs collapse to a single row, so the run time
+                    // rides inline at the end of the title line rather than in
+                    // the folder subtitle below (which they omit entirely).
+                    .when(show_run_time, |element| {
+                        element.when_some(time_label.clone(), |element, label| {
                             element.child(
                                 div()
                                     .flex_none()
-                                    .text_color(if session.is_busy() {
-                                        theme.text_tertiary
-                                    } else {
-                                        theme.text_ghost
-                                    })
+                                    .text_size(px(11.5))
+                                    .text_color(time_label_color)
                                     .child(SharedString::from(label)),
                             )
-                        },
-                    ),
+                        })
+                    }),
             )
+            .when(!show_run_time, |element| {
+                element.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(5.0))
+                        .text_size(px(11.5))
+                        .line_height(px(15.0))
+                        .child(icon("icons/folder.svg", 11.0, theme.text_tertiary))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_color(theme.text_tertiary)
+                                .child(SharedString::from(project_name)),
+                        )
+                        .when_some(time_label.clone(), |element, label| {
+                            element.child(
+                                div()
+                                    .flex_none()
+                                    .text_color(time_label_color)
+                                    .child(SharedString::from(label)),
+                            )
+                        }),
+                )
+            })
             .when(!renaming, |element| {
                 element
                     .track_focus(&row_focus)
@@ -1557,6 +2178,68 @@ impl Waku {
     }
 }
 
+fn sidebar_rows_fingerprint(
+    sessions: &[AgentSession],
+    automations: &[crate::automation::Automation],
+    selected_session: Option<Uuid>,
+    today: NaiveDate,
+    collapsed_groups: &HashSet<SessionDateGroup>,
+    automations_collapsed: bool,
+    expanded_automations: &HashSet<Uuid>,
+    expanded_automation_runs: &HashSet<Uuid>,
+) -> u64 {
+    let mut fingerprint = mix(0x51de_ba5e_5eed_c0de, today.num_days_from_ce() as u64);
+    for session in sessions {
+        if !session.has_started() {
+            continue;
+        }
+        fingerprint = mix_uuid(fingerprint, session.id);
+        fingerprint = mix(fingerprint, sidebar_session_timestamp(session));
+        // `sidebar_rows` also caches each automation group's spinner state, and
+        // a run can go Connecting -> Working -> Failed without ever landing a
+        // reply, so the recency timestamp above would not move.
+        if session.originating_automation.is_some() {
+            fingerprint = mix(fingerprint, session.status as u64 + 1);
+        }
+    }
+    // The group rows cache each automation's name and enabled flag, so a rename
+    // or a toggle has to invalidate the snapshot even though no session moved.
+    for automation in automations {
+        fingerprint = mix_uuid(fingerprint, automation.id);
+        fingerprint = mix(fingerprint, automation.updated_at);
+        fingerprint = mix(fingerprint, u64::from(automation.enabled));
+    }
+    // A collapsed group mirrors its selected run's highlight, which is cached
+    // alongside the rest of the metadata.
+    fingerprint = match selected_session {
+        Some(session_id) => mix_uuid(fingerprint, session_id),
+        None => mix(fingerprint, 0x5e1e_c7ed_0000_0000),
+    };
+    // Sets have no stable iteration order; combine each one order-independently
+    // and use distinct seeds so moving an id between disclosures changes the key.
+    let collapsed = collapsed_groups.iter().fold(0u64, |combined, group| {
+        combined.wrapping_add(mix(0, group.index() as u64 + 1))
+    });
+    fingerprint = mix(mix(fingerprint, collapsed_groups.len() as u64), collapsed);
+    fingerprint = mix(fingerprint, u64::from(automations_collapsed));
+
+    let expanded = expanded_automations.iter().fold(0u64, |combined, id| {
+        combined.wrapping_add(mix_uuid(0xa710_5eed, *id))
+    });
+    fingerprint = mix(
+        mix(fingerprint, expanded_automations.len() as u64),
+        expanded,
+    );
+
+    let expanded_runs = expanded_automation_runs.iter().fold(0u64, |combined, id| {
+        combined.wrapping_add(mix_uuid(0x7a11_5eed, *id))
+    });
+    mix(
+        mix(fingerprint, expanded_automation_runs.len() as u64),
+        expanded_runs,
+    )
+}
+
 fn localized_session_title(session: &AgentSession) -> String {
     let title = session.display_title();
     if title == AgentSession::DEFAULT_TITLE {
@@ -1671,5 +2354,172 @@ mod tests {
             pending
         ));
         assert!(sidebar_session_selected(Some(current), None, current));
+    }
+
+    #[test]
+    fn automation_disclosures_invalidate_sidebar_rows() {
+        let today = NaiveDate::from_ymd_opt(2026, 8, 12).unwrap();
+        let automation_id = Uuid::from_u128(1);
+        let sessions = Vec::new();
+        let automations = Vec::new();
+        let collapsed_groups = HashSet::new();
+        let collapsed = HashSet::new();
+        let expanded = HashSet::from([automation_id]);
+
+        let baseline = sidebar_rows_fingerprint(
+            &sessions,
+            &automations,
+            None,
+            today,
+            &collapsed_groups,
+            false,
+            &collapsed,
+            &collapsed,
+        );
+        assert_ne!(
+            baseline,
+            sidebar_rows_fingerprint(
+                &sessions,
+                &automations,
+                None,
+                today,
+                &collapsed_groups,
+                true,
+                &collapsed,
+                &collapsed,
+            ),
+            "collapsing the Automations section must invalidate its row snapshot"
+        );
+        assert_ne!(
+            baseline,
+            sidebar_rows_fingerprint(
+                &sessions,
+                &automations,
+                None,
+                today,
+                &collapsed_groups,
+                false,
+                &expanded,
+                &collapsed,
+            ),
+            "expanding an automation must invalidate its run rows"
+        );
+        assert_ne!(
+            baseline,
+            sidebar_rows_fingerprint(
+                &sessions,
+                &automations,
+                None,
+                today,
+                &collapsed_groups,
+                false,
+                &collapsed,
+                &expanded,
+            ),
+            "showing all automation runs must invalidate its run rows"
+        );
+    }
+
+    /// The group rows cache the automation's name, enabled flag, spinner, and
+    /// selection highlight. None of those move a session's recency timestamp,
+    /// so each one needs its own fingerprint input or the sidebar renders the
+    /// last-cached value indefinitely.
+    #[test]
+    fn automation_metadata_changes_invalidate_sidebar_rows() {
+        use crate::automation::Automation;
+
+        let today = NaiveDate::from_ymd_opt(2026, 8, 12).unwrap();
+        let collapsed_groups = HashSet::new();
+        let collapsed = HashSet::new();
+        let automation = Automation::new("Nightly", ProviderKind::Codex, 1_000);
+        let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
+        session.originating_automation = Some(automation.id);
+        session.begin_turn("run");
+        session.status = SessionStatus::Connecting;
+        let session_id = session.id;
+        let sessions = vec![session];
+        let automations = vec![automation.clone()];
+
+        let fingerprint =
+            |sessions: &[AgentSession], automations: &[Automation], selected: Option<Uuid>| {
+                sidebar_rows_fingerprint(
+                    sessions,
+                    automations,
+                    selected,
+                    today,
+                    &collapsed_groups,
+                    false,
+                    &collapsed,
+                    &collapsed,
+                )
+            };
+        let baseline = fingerprint(&sessions, &automations, None);
+
+        let mut renamed = automation.clone();
+        renamed.name = "Renamed".to_owned();
+        renamed.updated_at = automation.updated_at + 1;
+        assert_ne!(
+            baseline,
+            fingerprint(&sessions, &[renamed], None),
+            "renaming an automation must invalidate its cached group name"
+        );
+
+        let mut disabled = automation.clone();
+        disabled.enabled = false;
+        assert_ne!(
+            baseline,
+            fingerprint(&sessions, &[disabled], None),
+            "toggling an automation must invalidate its cached enabled state"
+        );
+
+        assert_ne!(
+            baseline,
+            fingerprint(&sessions, &automations, Some(session_id)),
+            "selecting a run must invalidate the group's cached highlight"
+        );
+
+        let mut working = sessions.clone();
+        working[0].status = SessionStatus::Failed;
+        assert_ne!(
+            baseline,
+            fingerprint(&working, &automations, None),
+            "a run settling without a reply must invalidate the group's spinner"
+        );
+    }
+
+    #[test]
+    fn automation_metadata_is_built_for_all_groups_in_one_session_pass() {
+        let project_id = Uuid::new_v4();
+        let first_automation = Uuid::new_v4();
+        let second_automation = Uuid::new_v4();
+        let mut first = AgentSession::new(project_id, ProviderKind::Codex);
+        first.originating_automation = Some(first_automation);
+        first.created_at = 10;
+        first.status = SessionStatus::Working;
+        let mut second = AgentSession::new(project_id, ProviderKind::Codex);
+        second.originating_automation = Some(first_automation);
+        second.created_at = 20;
+        let mut third = AgentSession::new(project_id, ProviderKind::Codex);
+        third.originating_automation = Some(second_automation);
+        third.created_at = 30;
+
+        let metadata = automation_sidebar_metadata(
+            [&first, &second, &third],
+            std::iter::empty(),
+            Some(second.id),
+            1_000,
+        );
+        assert_eq!(
+            metadata[&first_automation],
+            AutomationSidebarMetadata {
+                name: None,
+                enabled: true,
+                time_label: None,
+                running_status: Some(SessionStatus::Working),
+                owns_selection: true,
+                run_count: 2,
+            }
+        );
+        assert_eq!(metadata[&second_automation].run_count, 1);
     }
 }

@@ -64,6 +64,7 @@ pub fn init(cx: &mut App) {
 enum PaletteSection {
     Suggested,
     Tasks,
+    Automations,
     Commands,
     Settings,
 }
@@ -73,14 +74,17 @@ impl PaletteSection {
         crate::i18n::translate(match self {
             Self::Suggested => "command_palette.suggested",
             Self::Tasks => "command_palette.tasks",
+            Self::Automations => "command_palette.automations",
             Self::Commands => "command_palette.commands",
             Self::Settings => "command_palette.settings",
         })
     }
 
     fn query_rank(self) -> usize {
+        // Automation items are scored in their own group and never sorted
+        // against commands, so this rank only needs to be defined, not tuned.
         match self {
-            Self::Tasks => 0,
+            Self::Tasks | Self::Automations => 0,
             Self::Commands | Self::Suggested => 1,
             Self::Settings => 2,
         }
@@ -104,6 +108,9 @@ enum PaletteAction {
     ToggleRightPanel,
     OpenSettings(SettingsPage),
     SelectTask(Uuid),
+    OpenAutomations,
+    NewAutomation,
+    OpenAutomation(Uuid),
 }
 
 #[derive(Clone, Debug)]
@@ -149,6 +156,36 @@ impl CommandPaletteItem {
 struct ScoredPaletteItem {
     score: u32,
     item: CommandPaletteItem,
+}
+
+fn score_palette_candidates(
+    candidates: impl IntoIterator<Item = CommandPaletteItem>,
+    pattern: &Pattern,
+    matcher: &mut Matcher,
+    utf32: &mut Vec<char>,
+    compare: impl FnMut(&ScoredPaletteItem, &ScoredPaletteItem) -> std::cmp::Ordering,
+) -> Vec<ScoredPaletteItem> {
+    let mut scored = candidates
+        .into_iter()
+        .filter_map(|item| {
+            pattern
+                .score(Utf32Str::new(&item.search_text, utf32), matcher)
+                .map(|score| ScoredPaletteItem { score, item })
+        })
+        .collect::<Vec<_>>();
+    scored.sort_by(compare);
+    scored
+}
+
+/// How much of an automation's prompt is worth indexing for search.
+const AUTOMATION_SEARCH_PROMPT_CHARS: usize = 160;
+
+/// The first `limit` characters of `text`, cut on a character boundary.
+fn search_prefix(text: &str, limit: usize) -> &str {
+    match text.char_indices().nth(limit) {
+        Some((end, _)) => &text[..end],
+        None => text,
+    }
 }
 
 fn next_selection_index(selected: usize, len: usize, delta: isize) -> Option<usize> {
@@ -542,6 +579,24 @@ impl Waku {
                 "open add folder project workspace repository repo",
                 next(),
             ),
+            CommandPaletteItem::command(
+                display_section(PaletteSection::Suggested),
+                tr!("automations.title"),
+                "icons/zap.svg",
+                None,
+                PaletteAction::OpenAutomations,
+                "automations scheduled recurring cron jobs schedule",
+                next(),
+            ),
+            CommandPaletteItem::command(
+                display_section(PaletteSection::Suggested),
+                tr!("command_palette.new_automation"),
+                "icons/zap.svg",
+                None,
+                PaletteAction::NewAutomation,
+                "new create automation scheduled recurring cron job schedule",
+                next(),
+            ),
         ];
 
         let can_choose_model = self
@@ -705,7 +760,17 @@ impl Waku {
                         (path.to_string_lossy().into_owned(), Some(branch.as_str()))
                     }
                 };
-                let mut details = vec![project.clone()];
+                // Automation runs are sessions; tag them with the automation's
+                // name so a run is recognizable and searchable by it.
+                let automation_name = session
+                    .originating_automation
+                    .and_then(|id| self.state.automation(id))
+                    .map(|automation| automation.name.clone());
+                let mut details = Vec::new();
+                if let Some(name) = &automation_name {
+                    details.push(tr!("command_palette.automation_run", name = name.clone()));
+                }
+                details.push(project.clone());
                 if let Some(branch) = branch {
                     details.push(format!("#{branch}"));
                 }
@@ -722,11 +787,15 @@ impl Waku {
                 CommandPaletteItem {
                     section: PaletteSection::Tasks,
                     search_text: format!(
-                        "{label} {project} {project_path} {workspace_path} {} {} {} {} task session chat conversation",
+                        "{label} {project} {project_path} {workspace_path} {} {} {} {} {} task session chat conversation",
                         branch.unwrap_or_default(),
                         session.provider.short_name(),
                         session.provider.display_name(),
                         session.model.as_deref().unwrap_or_default(),
+                        automation_name
+                            .as_deref()
+                            .map(|name| format!("{name} automation run scheduled"))
+                            .unwrap_or_default(),
                     ),
                     label,
                     detail: Some(detail),
@@ -736,6 +805,45 @@ impl Waku {
                     content_match,
                     order,
                     recency: session.updated_at,
+                }
+            })
+            .collect()
+    }
+
+    /// One item per saved automation, opening its editor. Runs themselves stay
+    /// in Tasks (they are sessions); this section is the automations themselves.
+    fn command_palette_automation_candidates(&self) -> Vec<CommandPaletteItem> {
+        self.state
+            .automations
+            .iter()
+            .enumerate()
+            .map(|(order, automation)| {
+                let summary = super::automations_page::schedule_summary(&automation.schedule);
+                let detail = if automation.enabled {
+                    summary.clone()
+                } else {
+                    format!("{summary} · {}", tr!("automations.disabled"))
+                };
+                CommandPaletteItem {
+                    section: PaletteSection::Automations,
+                    search_text: format!(
+                        "{} {} automation scheduled recurring cron {summary}",
+                        automation.name,
+                        // The whole prompt would be re-encoded to UTF-32 and
+                        // fuzzy-scored on every keystroke, and a long one
+                        // matches on words that say nothing about which
+                        // automation this is. The opening line is what a user
+                        // recognizes it by.
+                        search_prefix(&automation.prompt, AUTOMATION_SEARCH_PROMPT_CHARS),
+                    ),
+                    label: automation.name.clone(),
+                    detail: Some(detail),
+                    icon: PaletteIcon::Asset("icons/zap.svg"),
+                    shortcut: None,
+                    action: PaletteAction::OpenAutomation(automation.id),
+                    content_match: None,
+                    order,
+                    recency: automation.updated_at,
                 }
             })
             .collect()
@@ -797,26 +905,33 @@ impl Waku {
         });
         tasks.truncate(MAX_TASK_RESULTS);
 
-        let mut commands = self
-            .command_palette_commands(true)
-            .into_iter()
-            .filter_map(|item| {
-                pattern
-                    .score(
-                        Utf32Str::new(&item.search_text, &mut utf32),
-                        &mut self.command_palette.matcher,
-                    )
-                    .map(|score| ScoredPaletteItem { score, item })
-            })
-            .collect::<Vec<_>>();
-        commands.sort_by(|a, b| {
-            a.item
-                .section
-                .query_rank()
-                .cmp(&b.item.section.query_rank())
-                .then(b.score.cmp(&a.score))
-                .then(a.item.order.cmp(&b.item.order))
-        });
+        let automations = score_palette_candidates(
+            self.command_palette_automation_candidates(),
+            &pattern,
+            &mut self.command_palette.matcher,
+            &mut utf32,
+            |a, b| {
+                b.score
+                    .cmp(&a.score)
+                    .then(b.item.recency.cmp(&a.item.recency))
+                    .then(a.item.order.cmp(&b.item.order))
+            },
+        );
+
+        let commands = score_palette_candidates(
+            self.command_palette_commands(true),
+            &pattern,
+            &mut self.command_palette.matcher,
+            &mut utf32,
+            |a, b| {
+                a.item
+                    .section
+                    .query_rank()
+                    .cmp(&b.item.section.query_rank())
+                    .then(b.score.cmp(&a.score))
+                    .then(a.item.order.cmp(&b.item.order))
+            },
+        );
 
         let selected_action = preserve_selection.then(|| {
             self.command_palette
@@ -826,6 +941,7 @@ impl Waku {
         });
         let next_results = tasks
             .into_iter()
+            .chain(automations)
             .chain(commands)
             .map(|scored| scored.item)
             .collect::<Vec<_>>();
@@ -921,6 +1037,9 @@ impl Waku {
                 let focus = self.composer_focus(cx);
                 window.focus(&focus, cx);
             }
+            PaletteAction::OpenAutomations => self.open_automations(window, cx),
+            PaletteAction::NewAutomation => self.open_automation_editor(None, window, cx),
+            PaletteAction::OpenAutomation(id) => self.open_automation_editor(Some(id), window, cx),
             PaletteAction::ChooseModel | PaletteAction::ToggleUsage => {
                 // These popovers are rendered by the composer. If the command
                 // came from Settings, reveal one normal app frame first so its
@@ -1247,6 +1366,18 @@ mod tests {
         let mut matcher = crate::composer_complete::matcher();
         let mut buf = Vec::new();
         pattern.score(Utf32Str::new(candidate, &mut buf), &mut matcher)
+    }
+
+    #[test]
+    fn search_prefix_truncates_on_character_boundaries() {
+        assert_eq!(search_prefix("short", 160), "short");
+        assert_eq!(search_prefix("abcdef", 3), "abc");
+        assert_eq!(search_prefix("", 3), "");
+        // Multi-byte input is the whole reason this is not `&text[..limit]`:
+        // slicing mid-character panics.
+        assert_eq!(search_prefix("日本語のプロンプト", 3), "日本語");
+        assert_eq!(search_prefix("日本語", 10), "日本語");
+        assert_eq!(search_prefix("🚀🚀🚀", 2), "🚀🚀");
     }
 
     #[test]

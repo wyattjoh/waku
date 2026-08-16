@@ -1288,6 +1288,20 @@ pub struct Waku {
     /// Date groups the user has folded in the sidebar. This is intentionally
     /// runtime-only, like transcript disclosure state.
     sidebar_collapsed_groups: HashSet<SessionDateGroup>,
+    /// Per-automation sidebar data rebuilt with the row snapshot, never in a
+    /// virtualized row builder.
+    sidebar_automation_metadata: RefCell<HashMap<Uuid, sidebar::AutomationSidebarMetadata>>,
+    /// Whether the automations section at the top of the sidebar is folded.
+    /// Runtime-only, like `sidebar_collapsed_groups`.
+    sidebar_automations_collapsed: bool,
+    /// Per-automation run groups the user has expanded in the sidebar. Groups
+    /// are collapsed by default (absent from the set), so a busy automation
+    /// shows as a single named row until opened. Runtime-only.
+    sidebar_expanded_automations: HashSet<Uuid>,
+    /// Automation groups whose run list is fully expanded past the collapsed
+    /// preview (first few runs). Absent means only the preview shows with a
+    /// "Show more" toggle. Runtime-only, like `sidebar_expanded_automations`.
+    sidebar_expanded_automation_runs: HashSet<Uuid>,
     sidebar_visible: bool,
     sidebar_width: f32,
     right_panel_visible: bool,
@@ -1432,7 +1446,7 @@ pub struct Waku {
     sidebar_row_cache: RefCell<Vec<SidebarRow>>,
     /// Fingerprint + snapshot pair backing `sidebar_rows_cached`.
     sidebar_rows_fingerprint: Cell<Option<u64>>,
-    sidebar_rows_snapshot: RefCell<Rc<Vec<SidebarRow>>>,
+    sidebar_rows_snapshot: RefCell<Rc<SidebarRows>>,
     transcript_row_kinds: RefCell<Vec<TranscriptRowKind>>,
     /// Fingerprint of the transcript inputs `transcript_row_kinds` was folded
     /// from, so an unchanged transcript costs nothing on a frame. `None` until
@@ -1559,7 +1573,7 @@ use components::*;
 pub use image_preview::init as init_image_preview_keys;
 pub use settings::init as init_settings_keys;
 pub use sidebar::init as init_sidebar_keys;
-use sidebar::{SessionDateGroup, SidebarRow};
+use sidebar::{SessionDateGroup, SidebarRow, SidebarRows};
 pub use skills_page::init as init_skills_keys;
 use streaming::*;
 use transcript::*;
@@ -2781,6 +2795,10 @@ impl Waku {
                 session_rename: None,
                 session_rename_input,
                 sidebar_collapsed_groups: HashSet::new(),
+                sidebar_automation_metadata: RefCell::new(HashMap::new()),
+                sidebar_automations_collapsed: false,
+                sidebar_expanded_automations: HashSet::new(),
+                sidebar_expanded_automation_runs: HashSet::new(),
                 sidebar_visible,
                 sidebar_width,
                 right_panel_visible,
@@ -2874,7 +2892,7 @@ impl Waku {
                 sidebar_scrollbar: ScrollbarState::new(),
                 sidebar_row_cache: RefCell::new(Vec::new()),
                 sidebar_rows_fingerprint: Cell::new(None),
-                sidebar_rows_snapshot: RefCell::new(Rc::new(Vec::new())),
+                sidebar_rows_snapshot: RefCell::new(Rc::new(SidebarRows::default())),
                 transcript_row_kinds: RefCell::new(Vec::new()),
                 transcript_row_kinds_fingerprint: Cell::new(None),
                 transcript_navigation_turns: RefCell::new(Rc::new(Vec::new())),
