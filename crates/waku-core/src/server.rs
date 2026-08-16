@@ -3,10 +3,10 @@ use std::io;
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, bail};
-use crossbeam_channel::{Receiver, Sender, unbounded};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, bounded, unbounded};
 use parking_lot::Mutex;
 use subtle::ConstantTimeEq as _;
 use tungstenite::handshake::server::{
@@ -20,8 +20,8 @@ use uuid::Uuid;
 use crate::model::{AgentSession, Project, ProviderKind, SessionStatus};
 use crate::protocol::MAX_WIRE_MESSAGE_BYTES;
 use crate::protocol::{
-    ClientMessage, Command, PROTOCOL_VERSION, ReplayCursor, Request, ResponseOutcome,
-    ResponsePayload, RpcError, SequencedEvent, ServerMessage, WireDriverEvent,
+    AutomationNotification, ClientMessage, Command, PROTOCOL_VERSION, ReplayCursor, Request,
+    ResponseOutcome, ResponsePayload, RpcError, SequencedEvent, ServerMessage, WireDriverEvent,
 };
 
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -30,6 +30,7 @@ const MAX_HANDSHAKE_MESSAGE_BYTES: usize = 64 * 1024;
 const MAX_CONNECTIONS: usize = 64;
 const MAX_REPLAY_EVENTS_PER_SESSION: usize = 4096;
 const MAX_CACHED_RESPONSES: usize = 2048;
+const WALL_CLOCK_MINUTE: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Debug, Default)]
 pub struct ServerOptions {
@@ -53,7 +54,46 @@ impl Drop for ConnectionPermit {
 pub trait Backend: Send + Sync + 'static {
     fn handle(&self, request: Request, events: EventSink) -> anyhow::Result<ResponsePayload>;
 
+    /// Called by the daemon-owned scheduler on its planning cadence.
+    /// Backends that do not host automations can keep the default no-op.
+    ///
+    /// Takes an owned handle so an implementation can move work it must not do
+    /// on the scheduler thread onto its own thread.
+    fn tick(self: Arc<Self>, _events: EventSink) {}
+
     fn shutdown(&self) {}
+}
+
+/// Return the time remaining before the next whole wall-clock minute.
+///
+/// Exact boundaries advance to the following minute. This keeps a scheduler
+/// tick delivered at `hh:mm:00` from immediately scheduling a duplicate tick
+/// at the same boundary.
+fn delay_until_next_minute(now: SystemTime) -> Duration {
+    let since_epoch = now.duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO);
+    let elapsed_in_minute = Duration::new(
+        since_epoch.as_secs() % WALL_CLOCK_MINUTE.as_secs(),
+        since_epoch.subsec_nanos(),
+    );
+    WALL_CLOCK_MINUTE - elapsed_in_minute
+}
+
+fn run_automation_scheduler(
+    backend: Arc<dyn Backend>,
+    events: EventSink,
+    shutdown: &AtomicBool,
+    mut now: impl FnMut() -> SystemTime,
+    mut wait: impl FnMut(Duration) -> bool,
+) {
+    while !shutdown.load(Ordering::Acquire) {
+        // The first tick is immediate for startup catch-up. Later ticks arrive
+        // after `wait`, then calculate their next target from the current wall
+        // clock so tick work and delayed timer delivery cannot accumulate drift.
+        backend.clone().tick(events.clone());
+        if !wait(delay_until_next_minute(now())) {
+            break;
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -64,6 +104,45 @@ pub struct EventSink {
 }
 
 impl EventSink {
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Self {
+        let hub = Arc::new(Hub::default());
+        hub.event_sink(Uuid::nil(), Uuid::nil())
+    }
+
+    /// Begin a daemon-owned runtime and return the sink used to publish its
+    /// events. Client-started runtimes normally get this from the request
+    /// dispatcher; scheduled runs need the same hub lifecycle from the
+    /// daemon's scheduler thread.
+    pub fn for_runtime(&self, session_id: Uuid, runtime_id: Uuid) -> Self {
+        self.hub.begin_runtime(session_id, runtime_id);
+        Self {
+            session_id,
+            runtime_id,
+            hub: self.hub.clone(),
+        }
+    }
+
+    pub fn end_runtime(&self) {
+        self.hub.end_runtime(self.session_id, Some(self.runtime_id));
+    }
+
+    pub fn runtime_id(&self) -> Uuid {
+        self.runtime_id
+    }
+
+    /// Notify every connected client that daemon-owned task state changed.
+    pub fn task_state_changed(&self) {
+        self.hub.broadcast_task_state_changed(None);
+    }
+
+    /// Broadcast live notification intent to the clients attached right now.
+    /// It is deliberately not journaled, so a later client never raises an old
+    /// completion notification.
+    pub fn automation_notification(&self, notification: AutomationNotification) {
+        self.hub.broadcast_automation_notification(notification);
+    }
+
     pub fn send(&self, event: WireDriverEvent) -> anyhow::Result<()> {
         self.hub.emit(self.session_id, self.runtime_id, event, true);
         Ok(())
@@ -265,8 +344,33 @@ impl Hub {
     }
 
     fn task_state_changed(&self, source_subscriber_id: u64) {
+        self.broadcast_task_state_changed(Some(source_subscriber_id));
+    }
+
+    fn broadcast_automation_notification(&self, notification: AutomationNotification) {
+        let message = ServerMessage::AutomationNotification { notification };
+        self.state
+            .lock()
+            .subscribers
+            .retain(|_, subscriber| subscriber.send(message.clone()).is_ok());
+    }
+
+    fn broadcast_task_state_changed(&self, source_subscriber_id: Option<u64>) {
         let mut state = self.state.lock();
-        Self::broadcast_task_state_changed(&mut state, source_subscriber_id);
+        Self::broadcast_task_state_changed_locked(&mut state, source_subscriber_id);
+    }
+
+    fn broadcast_task_state_changed_locked(
+        state: &mut HubState,
+        source_subscriber_id: Option<u64>,
+    ) {
+        state.task_state_revision = state.task_state_revision.saturating_add(1);
+        let message = ServerMessage::TaskStateChanged {
+            revision: state.task_state_revision,
+        };
+        state.subscribers.retain(|subscriber_id, subscriber| {
+            source_subscriber_id == Some(*subscriber_id) || subscriber.send(message.clone()).is_ok()
+        });
     }
 
     fn replace_task_catalog(&self, projects: &[Project], sessions: &[AgentSession]) {
@@ -304,18 +408,8 @@ impl Hub {
                 .is_none_or(|previous| previous != next);
         }
         if changed {
-            Self::broadcast_task_state_changed(&mut state, source_subscriber_id);
+            Self::broadcast_task_state_changed_locked(&mut state, Some(source_subscriber_id));
         }
-    }
-
-    fn broadcast_task_state_changed(state: &mut HubState, source_subscriber_id: u64) {
-        state.task_state_revision = state.task_state_revision.saturating_add(1);
-        let message = ServerMessage::TaskStateChanged {
-            revision: state.task_state_revision,
-        };
-        state.subscribers.retain(|subscriber_id, subscriber| {
-            *subscriber_id == source_subscriber_id || subscriber.send(message.clone()).is_ok()
-        });
     }
 
     fn cached_response(&self, request_id: Uuid) -> Option<ResponseOutcome> {
@@ -472,44 +566,82 @@ pub fn serve(
     let dispatcher = Arc::new(RequestDispatcher::new(backend.clone(), hub.clone()));
     let options = Arc::new(options);
     let active_connections = Arc::new(AtomicUsize::new(0));
-    while !shutdown.load(Ordering::Acquire) {
-        match listener.accept() {
-            Ok((stream, _)) => {
-                if active_connections
-                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
-                        (active < MAX_CONNECTIONS).then_some(active + 1)
-                    })
-                    .is_err()
-                {
-                    continue;
+    let scheduler_backend = backend.clone();
+    let scheduler_hub = hub.clone();
+    let scheduler_shutdown = shutdown.clone();
+    // A dedicated stop channel rather than only the shutdown flag: the loop
+    // spends nearly all of its time parked between ticks, and polling the flag
+    // would make teardown wait out a whole tick interval.
+    let (scheduler_stop, scheduler_stopped) = bounded::<()>(1);
+    let scheduler = std::thread::Builder::new()
+        .name("waku-daemon-automation-scheduler".into())
+        .spawn(move || {
+            run_automation_scheduler(
+                scheduler_backend,
+                scheduler_hub.event_sink(Uuid::nil(), Uuid::nil()),
+                scheduler_shutdown.as_ref(),
+                SystemTime::now,
+                |delay| {
+                    matches!(
+                        scheduler_stopped.recv_timeout(delay),
+                        Err(RecvTimeoutError::Timeout)
+                    )
+                },
+            );
+        })
+        .context("could not start automation scheduler")?;
+
+    // Every exit from the accept loop — clean shutdown, listener failure, or a
+    // connection thread that would not spawn — has to run the same teardown, so
+    // the loop yields a result instead of returning straight out of `serve`.
+    let listener_outcome = (|| -> anyhow::Result<()> {
+        while !shutdown.load(Ordering::Acquire) {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    if active_connections
+                        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                            (active < MAX_CONNECTIONS).then_some(active + 1)
+                        })
+                        .is_err()
+                    {
+                        continue;
+                    }
+                    let connection_permit = ConnectionPermit(active_connections.clone());
+                    let token = token.clone();
+                    let dispatcher = dispatcher.clone();
+                    let hub = hub.clone();
+                    let shutdown = shutdown.clone();
+                    let options = options.clone();
+                    std::thread::Builder::new()
+                        .name("waku-daemon-connection".into())
+                        .spawn(move || {
+                            let _connection_permit = connection_permit;
+                            if let Err(error) = handle_connection(
+                                stream, &token, dispatcher, hub, shutdown, &options,
+                            ) {
+                                eprintln!("waku-daemon connection ended: {error:#}");
+                            }
+                        })
+                        .context("could not start Waku daemon connection thread")?;
                 }
-                let connection_permit = ConnectionPermit(active_connections.clone());
-                let token = token.clone();
-                let dispatcher = dispatcher.clone();
-                let hub = hub.clone();
-                let shutdown = shutdown.clone();
-                let options = options.clone();
-                std::thread::Builder::new()
-                    .name("waku-daemon-connection".into())
-                    .spawn(move || {
-                        let _connection_permit = connection_permit;
-                        if let Err(error) =
-                            handle_connection(stream, &token, dispatcher, hub, shutdown, &options)
-                        {
-                            eprintln!("waku-daemon connection ended: {error:#}");
-                        }
-                    })
-                    .context("could not start Waku daemon connection thread")?;
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(ACCEPT_POLL_INTERVAL);
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error).context("Waku daemon listener failed"),
             }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                std::thread::sleep(ACCEPT_POLL_INTERVAL);
-            }
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(error) => return Err(error).context("Waku daemon listener failed"),
         }
-    }
+        Ok(())
+    })();
+
+    // Stop the scheduler before the backend tears down. `shutdown()` drops every
+    // live driver handle, and a tick still in flight would otherwise insert a
+    // freshly spawned provider into the session map after that sweep, orphaning
+    // its process for the lifetime of the machine.
+    let _ = scheduler_stop.try_send(());
+    let _ = scheduler.join();
     backend.shutdown();
-    Ok(())
+    listener_outcome
 }
 
 fn handle_connection(
@@ -896,7 +1028,9 @@ fn task_catalog_action(command: &Command) -> TaskCatalogAction {
         Command::SaveTaskState { projects, .. } => TaskCatalogAction::Save {
             projects: projects.clone(),
         },
-        Command::RemoveSession
+        Command::RunAutomation { .. }
+        | Command::ApplyAutomationChanges { .. }
+        | Command::RemoveSession
         | Command::ForkSessionFromResponse { .. }
         | Command::RewindSessionToMessage { .. } => TaskCatalogAction::Changed,
         _ => TaskCatalogAction::None,
@@ -1047,10 +1181,153 @@ mod tests {
                     sessions: self.sessions.lock().clone(),
                     default_cwd: PathBuf::from("/tmp"),
                     projectless_root: Some(PathBuf::from("/tmp/.waku/projects")),
+                    automations: Vec::new(),
                 }),
                 _ => Ok(ResponsePayload::Ack),
             }
         }
+    }
+
+    struct SchedulerProbeBackend {
+        ticks: AtomicUsize,
+        trace: Option<Arc<Mutex<Vec<&'static str>>>>,
+    }
+
+    impl SchedulerProbeBackend {
+        fn new(trace: Option<Arc<Mutex<Vec<&'static str>>>>) -> Self {
+            Self {
+                ticks: AtomicUsize::new(0),
+                trace,
+            }
+        }
+    }
+
+    impl Backend for SchedulerProbeBackend {
+        fn handle(&self, _request: Request, _events: EventSink) -> anyhow::Result<ResponsePayload> {
+            Ok(ResponsePayload::Ack)
+        }
+
+        fn tick(self: Arc<Self>, _events: EventSink) {
+            self.ticks.fetch_add(1, Ordering::Relaxed);
+            if let Some(trace) = &self.trace {
+                trace.lock().push("tick");
+            }
+        }
+    }
+
+    fn wall_time(seconds: u64, nanoseconds: u32) -> SystemTime {
+        UNIX_EPOCH + Duration::new(seconds, nanoseconds)
+    }
+
+    #[test]
+    fn minute_boundary_delay_handles_exact_and_rollover_times() {
+        assert_eq!(
+            delay_until_next_minute(wall_time(60, 0)),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            delay_until_next_minute(wall_time(60, 1)),
+            Duration::new(59, 999_999_999)
+        );
+        assert_eq!(
+            delay_until_next_minute(wall_time(119, 999_999_999)),
+            Duration::from_nanos(1)
+        );
+        assert_eq!(
+            delay_until_next_minute(wall_time(3_599, 250_000_000)),
+            Duration::from_millis(750)
+        );
+        assert_eq!(
+            delay_until_next_minute(wall_time(86_399, 500_000_000)),
+            Duration::from_millis(500)
+        );
+    }
+
+    #[test]
+    fn scheduler_ticks_before_waiting_on_startup() {
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let backend = Arc::new(SchedulerProbeBackend::new(Some(trace.clone())));
+        let clock_trace = trace.clone();
+        let wait_trace = trace.clone();
+
+        run_automation_scheduler(
+            backend.clone(),
+            EventSink::for_test(),
+            &AtomicBool::new(false),
+            move || {
+                clock_trace.lock().push("clock");
+                wall_time(17, 0)
+            },
+            move |_| {
+                wait_trace.lock().push("wait");
+                false
+            },
+        );
+
+        assert_eq!(backend.ticks.load(Ordering::Relaxed), 1);
+        assert_eq!(*trace.lock(), vec!["tick", "clock", "wait"]);
+    }
+
+    #[test]
+    fn scheduler_recalculates_boundaries_after_each_ticks_work() {
+        let backend = Arc::new(SchedulerProbeBackend::new(None));
+        let mut completed_ticks = VecDeque::from([
+            wall_time(17, 0),
+            wall_time(67, 0),
+            wall_time(122, 500_000_000),
+        ]);
+        let delays = Arc::new(Mutex::new(Vec::new()));
+        let recorded_delays = delays.clone();
+        let mut waits = 0;
+
+        run_automation_scheduler(
+            backend.clone(),
+            EventSink::for_test(),
+            &AtomicBool::new(false),
+            move || completed_ticks.pop_front().unwrap(),
+            move |delay| {
+                recorded_delays.lock().push(delay);
+                waits += 1;
+                waits < 3
+            },
+        );
+
+        assert_eq!(backend.ticks.load(Ordering::Relaxed), 3);
+        assert_eq!(
+            *delays.lock(),
+            vec![
+                Duration::from_secs(43),
+                Duration::from_secs(53),
+                Duration::new(57, 500_000_000),
+            ]
+        );
+    }
+
+    #[test]
+    fn late_wake_ticks_once_then_realigns() {
+        let backend = Arc::new(SchedulerProbeBackend::new(None));
+        let mut completed_ticks = VecDeque::from([wall_time(17, 0), wall_time(185, 0)]);
+        let delays = Arc::new(Mutex::new(Vec::new()));
+        let recorded_delays = delays.clone();
+        let mut waits = 0;
+
+        run_automation_scheduler(
+            backend.clone(),
+            EventSink::for_test(),
+            &AtomicBool::new(false),
+            move || completed_ticks.pop_front().unwrap(),
+            move |delay| {
+                recorded_delays.lock().push(delay);
+                waits += 1;
+                waits == 1
+            },
+        );
+
+        assert_eq!(backend.ticks.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            *delays.lock(),
+            vec![Duration::from_secs(43), Duration::from_secs(55)]
+        );
     }
 
     #[test]
@@ -1614,6 +1891,50 @@ mod tests {
         assert_eq!(event.runtime_id, new_runtime_id);
         assert_eq!(event.sequence, 1);
         assert_eq!(event.event.kind, "new");
+        assert!(events.try_recv().is_err());
+    }
+
+    #[test]
+    fn attached_client_receives_live_automation_notification() {
+        let hub = Arc::new(Hub::default());
+        let session_id = Uuid::new_v4();
+        let runtime_id = Uuid::new_v4();
+        hub.begin_runtime(session_id, runtime_id);
+        let (outgoing, events) = unbounded();
+        hub.subscribe(&[], outgoing);
+
+        hub.event_sink(session_id, runtime_id)
+            .automation_notification(AutomationNotification {
+                session_id,
+                name: "Nightly".into(),
+                outcome: crate::automation::RunOutcome::Failed,
+            });
+
+        assert!(matches!(
+            events.recv().unwrap(),
+            ServerMessage::AutomationNotification { notification }
+                if notification.session_id == session_id
+                    && notification.name == "Nightly"
+                    && notification.outcome == crate::automation::RunOutcome::Failed
+        ));
+    }
+
+    #[test]
+    fn ephemeral_automation_notification_is_not_replayed_without_a_client() {
+        let hub = Arc::new(Hub::default());
+        let session_id = Uuid::new_v4();
+        let runtime_id = Uuid::new_v4();
+        hub.begin_runtime(session_id, runtime_id);
+        hub.event_sink(session_id, runtime_id)
+            .automation_notification(AutomationNotification {
+                session_id,
+                name: "Nightly".into(),
+                outcome: crate::automation::RunOutcome::Failed,
+            });
+
+        assert!(hub.state.lock().journal.is_empty());
+        let (outgoing, events) = unbounded();
+        hub.subscribe(&[], outgoing);
         assert!(events.try_recv().is_err());
     }
 
