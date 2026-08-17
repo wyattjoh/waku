@@ -4,6 +4,10 @@ How Waku talks to each coding agent: the process it launches, the wire protocol
 it speaks, how long that process lives, and what has to be emulated because the
 CLI does not offer it.
 
+How each of them names a session — which are read from the provider, which are
+polled off disk, and the one Waku generates itself — is in
+[titles.md](titles.md).
+
 Every provider is reached through the same driver abstraction in
 [src/driver/mod.rs](../src/driver/mod.rs). There are six transport
 implementations behind seven providers, and **every one of them holds a session

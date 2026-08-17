@@ -6815,6 +6815,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
+name = "similar"
+version = "3.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "85ee016af5d736b69fc89e19254540fa4b5f5492853fb5503920f084011c78b6"
+dependencies = [
+ "bstr",
+]
+
+[[package]]
 name = "simplecss"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8172,7 +8181,7 @@ checksum = "317211a0dc0ceedd78fb2ca9a44aed3d7b9b26f81870d485c07122b4350673b7"
 
 [[package]]
 name = "waku"
-version = "0.1.2"
+version = "0.1.4"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -8287,6 +8296,7 @@ dependencies = [
  "rust-i18n",
  "serde",
  "serde_json",
+ "similar",
  "ts-rs",
  "uuid",
 ]

@@ -283,6 +283,7 @@ activity.ask_questions: 提问
 activity.arguments: 参数
 activity.output: 输出
 activity.image_output: 图片输出
+activity.open_file: 打开文件
 activity.search_for: 搜索：%{query}
 activity.searched_web: 已搜索网页
 activity.open_url: 打开 %{url}
@@ -801,6 +802,10 @@ diff.resize_tree: 调整差异文件树宽度
 diff.changed_files: 已更改的文件
 diff.file_count_one: 1 个文件
 diff.file_count: "%{count} 个文件"
+diff.status_added: 新增
+diff.status_deleted: 删除
+diff.rows_hidden_one: 还有 1 行 · 打开审阅查看完整更改
+diff.rows_hidden: "还有 %{count} 行 · 打开审阅查看完整更改"
 terminal.transport_failed: 终端传输失败
 terminal.no_workspace_description: 请先选择一个任务，再打开终端。
 terminal.process_exited: 进程已退出

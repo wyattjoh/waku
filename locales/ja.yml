@@ -301,6 +301,7 @@ activity.ask_questions: 質問する
 activity.arguments: 引数
 activity.output: 出力
 activity.image_output: 画像出力
+activity.open_file: ファイルを開く
 activity.search_for: "%{query} を検索"
 activity.searched_web: ウェブを検索しました
 activity.open_url: "%{url} を開く"
@@ -844,6 +845,10 @@ diff.resize_tree: 差分ファイルツリーの幅を変更
 diff.changed_files: 変更されたファイル
 diff.file_count_one: ファイル 1 件
 diff.file_count: "ファイル %{count} 件"
+diff.status_added: 追加
+diff.status_deleted: 削除
+diff.rows_hidden_one: 残り 1 行 · レビューを開くと変更全体を読めます
+diff.rows_hidden: "残り %{count} 行 · レビューを開くと変更全体を読めます"
 terminal.transport_failed: ターミナル転送に失敗しました
 terminal.no_workspace_description: ターミナルを開く前にタスクを選択してください。
 terminal.process_exited: プロセスが終了しました

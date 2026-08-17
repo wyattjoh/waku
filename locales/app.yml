@@ -584,6 +584,8 @@ activity.output:
   en: Output
 activity.image_output:
   en: Image output
+activity.open_file:
+  en: Open file
 activity.search_for:
   en: Search for %{query}
 activity.searched_web:
@@ -1644,6 +1646,14 @@ diff.file_count_one:
   en: 1 file
 diff.file_count:
   en: "%{count} files"
+diff.status_added:
+  en: Added
+diff.status_deleted:
+  en: Deleted
+diff.rows_hidden_one:
+  en: 1 more line · open Review to read the whole change
+diff.rows_hidden:
+  en: "%{count} more lines · open Review to read the whole change"
 
 terminal.transport_failed:
   en: Terminal transport failed
