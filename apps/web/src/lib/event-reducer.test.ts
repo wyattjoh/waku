@@ -188,6 +188,66 @@ function apply(session: AgentSession, kind: string, payload: unknown) {
   return reduceRuntimeEvent(session, event(kind, payload), clock).session
 }
 
+describe('thread goals', () => {
+  test('stores goal updates and names a goal-first task from its objective', () => {
+    let session: AgentSession = { ...runningSession(), status: 'idle', messages: [], turns: [] }
+    session = apply(session, 'goalUpdated', {
+      objective: 'Improve benchmark coverage across the suite',
+      status: 'active',
+      tokenBudget: null,
+      tokensUsed: 0,
+      timeUsedSeconds: 0,
+    })
+
+    expect(session.thread_goal?.objective).toBe('Improve benchmark coverage across the suite')
+    expect(session.thread_goal?.status).toBe('active')
+    expect(session.auto_title).toBe('Improve benchmark coverage across the suite')
+
+    session = apply(session, 'goalUpdated', null)
+    expect(session.thread_goal).toBeNull()
+  })
+
+  test('an unsolicited codex turn gets a transcript home and streams output', () => {
+    let session: AgentSession = { ...runningSession(), status: 'idle', messages: [], turns: [] }
+    session = apply(session, 'turnStarted', null)
+
+    expect(session.status).toBe('working')
+    expect(session.turns).toHaveLength(1)
+    expect(session.turns[0]?.provider_turn_started).toBe(true)
+
+    session = apply(session, 'textDelta', 'Hi!')
+    expect(session.messages.at(-1)).toMatchObject({
+      role: 'assistant',
+      content: 'Hi!',
+      turn_id: session.turns[0]?.id,
+    })
+
+    const settled = reduceRuntimeEvent(
+      session,
+      event('turnFinished', { success: true, summary: null }),
+      clock,
+    )
+    expect(settled.settled).toBe(true)
+    expect(settled.session.status).toBe('idle')
+  })
+
+  test('unsolicited turns are codex-only and never preempt an active turn', () => {
+    const claude: AgentSession = {
+      ...runningSession(),
+      provider: 'claude',
+      status: 'idle',
+      messages: [],
+      turns: [],
+    }
+    expect(apply(claude, 'turnStarted', null).turns).toHaveLength(0)
+
+    const active = runningSession()
+    const next = apply(active, 'turnStarted', null)
+    expect(next.turns).toHaveLength(1)
+    expect(next.turns[0]?.id).toBe('turn')
+  })
+})
+
 function event(kind: string, payload: unknown): SequencedEvent {
   return {
     sessionId: 'session',

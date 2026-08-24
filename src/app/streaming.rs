@@ -120,6 +120,8 @@ impl Waku {
                 });
                 if let Some(activity) = matching {
                     let has_arguments = item.arguments.is_some();
+                    let replaces_changes = !item.file_changes.is_empty();
+                    let activity_id = activity.id;
                     activity.kind = item.kind;
                     activity.title = item.title;
                     activity.complete = item.complete;
@@ -154,6 +156,11 @@ impl Waku {
                     }
                     session.updated_at = unix_time();
                     runtime.stream_phase = Some(StreamPhase::Activity);
+                    if replaces_changes {
+                        // The rows this activity's diff was built from are gone;
+                        // an expanded card rebuilds from the new ones.
+                        self.activity_diffs.borrow_mut().remove(&activity_id);
+                    }
                     return;
                 }
             }
@@ -189,26 +196,17 @@ impl Waku {
             })
     }
 
-    pub(super) fn accepts_turn_output(&self, session_id: Uuid) -> bool {
+    pub(super) fn accepts_turn_output(&mut self, session_id: Uuid) -> bool {
         // The turn begins at submission accept, before its prompt has reached
         // any provider. While preparation is still running, a reused runtime
         // could only be draining leftovers of a settled turn — output landing
         // in the new turn then would attribute stale text to it.
-        !self.submission_preparations.contains(&session_id)
-            && self
-                .state
-                .sessions
-                .iter()
-                .find(|session| session.id == session_id)
-                .is_some_and(|session| {
-                    session.active_turn_id().is_some()
-                        && matches!(
-                            session.status,
-                            SessionStatus::Connecting
-                                | SessionStatus::Working
-                                | SessionStatus::Waiting
-                        )
-                })
+        if self.submission_preparations.contains(&session_id) {
+            return false;
+        }
+        self.state
+            .session_mut(session_id)
+            .is_some_and(session_accepts_turn_output)
     }
 
     /// Returns whether the runtime should remain attached after this event.
@@ -274,11 +272,23 @@ impl Waku {
             }
             DriverEvent::TurnStarted => {
                 runtime.last_driver_error = None;
-                if let Some(session) = self.state.session_mut(session_id)
-                    && session.active_turn_id().is_some()
-                {
-                    session.mark_active_turn_provider_started();
-                    session.status = SessionStatus::Working;
+                if let Some(session) = self.state.session_mut(session_id) {
+                    if session.active_turn_id().is_some() {
+                        // Covers submissions and the optimistic pursuit turn
+                        // a `/goal` began: the provider's start confirms it.
+                        session.mark_active_turn_provider_started();
+                        session.status = SessionStatus::Working;
+                    } else if session.provider == ProviderKind::Codex {
+                        // Codex starts turns on its own: goal continuation
+                        // pursues an active goal whenever the thread is
+                        // idle. Give the turn a transcript home — there is
+                        // no user message for it — so its work streams in
+                        // instead of being dropped.
+                        session.begin_provider_turn();
+                        session.mark_active_turn_provider_started();
+                        session.status = SessionStatus::Working;
+                        self.state.mark_session_dirty(session_id);
+                    }
                 }
             }
             DriverEvent::TextDelta(delta) => {
@@ -451,6 +461,28 @@ impl Waku {
                     self.plan_usage.insert(provider, usage);
                 }
             }
+            DriverEvent::GoalUpdated(goal) => {
+                // Conversation meta like usage: it applies regardless of turn
+                // state, and `None` means the provider cleared the goal.
+                if goal.is_some() {
+                    self.goal_observed_at.insert(session_id, Instant::now());
+                } else {
+                    self.goal_observed_at.remove(&session_id);
+                }
+                if let Some(session) = self.state.session_mut(session_id) {
+                    if let Some(goal) = &goal
+                        && session.messages.is_empty()
+                    {
+                        // A goal-first task is named after its objective
+                        // until the provider reports a better title.
+                        session.set_title_from_prompt(&goal.objective);
+                    }
+                    if session.thread_goal != goal {
+                        session.thread_goal = goal;
+                        self.state.mark_session_dirty(session_id);
+                    }
+                }
+            }
             DriverEvent::UsageUpdated {
                 context_tokens,
                 context_window,
@@ -593,6 +625,11 @@ impl Waku {
                 if self.state.selected_session == Some(session_id) {
                     self.show_toast(error.clone());
                 }
+                // An optimistic pursuit turn has no submission to fail with.
+                // Unwind it so the error cannot strand a spinner; if the
+                // pursuit does start later, its own start report recreates
+                // the turn.
+                self.unwind_unconfirmed_pursuit_turn(session_id);
                 let has_active_turn = self
                     .state
                     .sessions
@@ -697,6 +734,26 @@ impl Waku {
         }
         runtime.computer_use_previews.push(preview);
     }
+}
+
+/// Foreground output is stronger evidence of a started provider turn than a
+/// replayed lifecycle cursor. Repair both pieces of transient state here so a
+/// runtime attachment that missed `TurnStarted` cannot leave Cmd-Enter
+/// permanently falling back to the follow-up queue while output is visible.
+pub(super) fn session_accepts_turn_output(session: &mut AgentSession) -> bool {
+    if session.active_turn_id().is_none()
+        || !matches!(
+            session.status,
+            SessionStatus::Connecting | SessionStatus::Working | SessionStatus::Waiting
+        )
+    {
+        return false;
+    }
+    session.mark_active_turn_provider_started();
+    if session.status == SessionStatus::Connecting {
+        session.status = SessionStatus::Working;
+    }
+    true
 }
 
 /// A completed edit or shell command is the earliest provider-neutral point at

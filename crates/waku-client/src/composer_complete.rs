@@ -81,9 +81,15 @@ pub fn merge_reported_commands(
     merged
 }
 
-/// Whether the submitted text resolves to Waku's Codex-only fast-mode
-/// toggle. Checking the resolved entry preserves project/user command
-/// precedence when one of them intentionally owns `/fast`.
+/// Build the slash-prefixed text shown for an autocomplete command.
+pub fn command_composer_text(command: &SlashCommand) -> String {
+    format!("/{}", command.name)
+}
+
+/// Whether the submitted text resolves to Codex's native fast-mode command,
+/// which Waku bridges to the provider's service-tier control. Checking the
+/// resolved entry preserves project/user command precedence when one of them
+/// intentionally owns `/fast`.
 pub fn is_fast_mode_toggle_submission(
     provider: ProviderKind,
     prompt: &str,
@@ -112,6 +118,58 @@ pub fn toggled_fast_service_tier(
         "default".to_owned()
     } else {
         fast.id.clone()
+    })
+}
+
+/// A `/goal` composer submission parsed into its intent.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GoalCommand {
+    /// Bare `/goal` — show the current goal (and offer to create one).
+    Show,
+    Edit,
+    Pause,
+    Resume,
+    Clear,
+    /// `/goal <objective>` — start or replace the goal with this objective.
+    Set(String),
+}
+
+/// Parse the submitted text as Codex's native `/goal` command, which Waku
+/// bridges to `thread/goal/*`. `None` when it is not one — wrong provider,
+/// other text, or a project/user command that deliberately owns `/goal`
+/// (resolution precedence stands).
+pub fn parse_goal_submission(
+    provider: ProviderKind,
+    prompt: &str,
+    commands: &[SlashCommand],
+) -> Option<GoalCommand> {
+    if provider != ProviderKind::Codex {
+        return None;
+    }
+    let invocation = prompt.trim().strip_prefix('/')?;
+    let (name, arguments) = invocation
+        .split_once(char::is_whitespace)
+        .map_or((invocation, ""), |(name, arguments)| {
+            (name, arguments.trim())
+        });
+    if name != "goal" {
+        return None;
+    }
+    let goal_is_codex_builtin = commands.iter().any(|command| {
+        command.name == "goal"
+            && command.scope == CommandScope::Builtin
+            && command.template.is_none()
+    });
+    if !goal_is_codex_builtin {
+        return None;
+    }
+    Some(match arguments {
+        "" => GoalCommand::Show,
+        "edit" => GoalCommand::Edit,
+        "pause" => GoalCommand::Pause,
+        "resume" => GoalCommand::Resume,
+        "clear" => GoalCommand::Clear,
+        objective => GoalCommand::Set(objective.to_owned()),
     })
 }
 
@@ -155,18 +213,55 @@ pub fn expand_command_template(template: &str, args: &str) -> String {
     expanded
 }
 
-pub fn expanded_submission(prompt: &str, commands: &[SlashCommand]) -> Option<String> {
+/// Resolve composer text into the exact prompt expected by the provider.
+///
+/// Template commands expand to their body. Skills keep a slash in the
+/// composer and transcript, then resolve to each provider's native syntax at
+/// the transport boundary.
+pub fn resolved_submission(
+    provider: ProviderKind,
+    prompt: &str,
+    commands: &[SlashCommand],
+) -> Option<String> {
+    if let Some(skill) = resolved_skill_submission(provider, prompt, commands) {
+        return Some(skill);
+    }
     let invocation = prompt.strip_prefix('/')?;
     let (name, args) = invocation
         .split_once(char::is_whitespace)
         .map_or((invocation, ""), |(name, args)| (name, args.trim()));
-    let command = commands
+    let command = commands.iter().find(|command| command.name == name)?;
+    let template = command.template.as_deref()?;
+    Some(expand_command_template(template, args))
+}
+
+/// Resolve only provider-native skill syntax, without expanding templates.
+pub fn resolved_skill_submission(
+    provider: ProviderKind,
+    prompt: &str,
+    commands: &[SlashCommand],
+) -> Option<String> {
+    if !matches!(
+        provider,
+        ProviderKind::Codex | ProviderKind::Fx | ProviderKind::Pi | ProviderKind::OhMyPi
+    ) {
+        return None;
+    }
+    let invocation = prompt.strip_prefix('/')?;
+    let name = invocation
+        .split_once(char::is_whitespace)
+        .map_or(invocation, |(name, _)| name);
+    if !commands
         .iter()
-        .find(|command| command.name == name && command.template.is_some())?;
-    Some(expand_command_template(
-        command.template.as_deref().unwrap_or_default(),
-        args,
-    ))
+        .any(|command| command.name == name && command.scope == CommandScope::Skill)
+    {
+        return None;
+    }
+    Some(match provider {
+        ProviderKind::Codex | ProviderKind::Fx => format!("${invocation}"),
+        ProviderKind::Pi | ProviderKind::OhMyPi => format!("/skill:{invocation}"),
+        _ => unreachable!("non-native skill providers returned above"),
+    })
 }
 
 pub fn matcher() -> Matcher {
@@ -342,6 +437,67 @@ mod tests {
         assert_eq!(toggled_fast_service_tier(None, &[]), None);
     }
 
+    #[test]
+    fn codex_skill_completion_keeps_slash_in_the_composer() {
+        let skill = command("mattpocock-skills:to-spec", CommandScope::Skill);
+        assert_eq!(command_composer_text(&skill), "/mattpocock-skills:to-spec");
+        assert_eq!(
+            command_composer_text(&command("fast", CommandScope::Builtin)),
+            "/fast"
+        );
+    }
+
+    #[test]
+    fn codex_skill_submission_uses_the_catalog_invocation() {
+        let skill = command("mattpocock-skills:to-spec", CommandScope::Skill);
+        assert_eq!(
+            resolved_submission(
+                ProviderKind::Codex,
+                "/mattpocock-skills:to-spec carefully",
+                std::slice::from_ref(&skill)
+            )
+            .as_deref(),
+            Some("$mattpocock-skills:to-spec carefully")
+        );
+        assert_eq!(
+            resolved_submission(
+                ProviderKind::Claude,
+                "/mattpocock-skills:to-spec carefully",
+                std::slice::from_ref(&skill)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn fx_skill_submission_uses_the_catalog_invocation() {
+        let skill = command("deploy", CommandScope::Skill);
+        assert_eq!(
+            resolved_submission(
+                ProviderKind::Fx,
+                "/deploy production",
+                std::slice::from_ref(&skill)
+            )
+            .as_deref(),
+            Some("$deploy production")
+        );
+    }
+
+    #[test]
+    fn pi_skill_submission_uses_the_skill_command() {
+        for provider in [ProviderKind::Pi, ProviderKind::OhMyPi] {
+            for name in ["to-spec", "to-tickets"] {
+                let skill = command(name, CommandScope::Skill);
+                let expected = format!("/skill:{name} carefully");
+                assert_eq!(
+                    resolved_skill_submission(provider, &format!("/{name} carefully"), &[skill])
+                        .as_deref(),
+                    Some(expected.as_str())
+                );
+            }
+        }
+    }
+
     fn command(name: &str, scope: CommandScope) -> SlashCommand {
         SlashCommand {
             name: name.into(),
@@ -350,5 +506,45 @@ mod tests {
             argument_hint: None,
             template: None,
         }
+    }
+
+    #[test]
+    fn goal_submissions_parse_into_their_intent() {
+        let builtin = command("goal", CommandScope::Builtin);
+        let commands = std::slice::from_ref(&builtin);
+        let parse = |prompt: &str| parse_goal_submission(ProviderKind::Codex, prompt, commands);
+
+        assert_eq!(parse("/goal"), Some(GoalCommand::Show));
+        assert_eq!(parse("/goal "), Some(GoalCommand::Show));
+        assert_eq!(parse("/goal edit"), Some(GoalCommand::Edit));
+        assert_eq!(parse("/goal pause"), Some(GoalCommand::Pause));
+        assert_eq!(parse("/goal resume"), Some(GoalCommand::Resume));
+        assert_eq!(parse("/goal clear"), Some(GoalCommand::Clear));
+        assert_eq!(
+            parse("/goal improve benchmark coverage"),
+            Some(GoalCommand::Set("improve benchmark coverage".into()))
+        );
+        assert_eq!(parse("/goals"), None);
+        assert_eq!(parse("ship /goal"), None);
+    }
+
+    #[test]
+    fn goal_command_is_codex_only_and_respects_overrides() {
+        let builtin = command("goal", CommandScope::Builtin);
+        assert_eq!(
+            parse_goal_submission(
+                ProviderKind::Claude,
+                "/goal",
+                std::slice::from_ref(&builtin)
+            ),
+            None
+        );
+        // A project command deliberately owning /goal wins the collision.
+        let mut project = command("goal", CommandScope::Project);
+        project.template = Some("do project things".into());
+        assert_eq!(
+            parse_goal_submission(ProviderKind::Codex, "/goal", std::slice::from_ref(&project)),
+            None
+        );
     }
 }

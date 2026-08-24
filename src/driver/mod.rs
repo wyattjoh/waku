@@ -1,11 +1,14 @@
 //! Desktop proxy for the provider runtime owned by `waku-daemon`.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::computer_use::ComputerToolRequest;
 use crate::model::{
     BackgroundWorkKey, DriverEvent, ProviderKind, ProviderResumeCursor, RuntimeEventCursor,
 };
+use crossbeam_channel::{Sender, bounded, select};
+use parking_lot::Mutex;
 
 pub use waku_client::driver::{
     DriverControl, DriverEventSender, DriverHandle, DriverStartOptions, SessionOptions,
@@ -13,12 +16,13 @@ pub use waku_client::driver::{
 };
 
 pub(crate) fn start_remote(
-    client: waku_client::DaemonClient,
+    daemon: waku_client::DaemonSupervisor,
     session_id: uuid::Uuid,
     provider: ProviderKind,
     options: DriverStartOptions,
     events: DriverEventSender,
 ) -> anyhow::Result<DriverHandle> {
+    let client = daemon.client();
     let runtime_id = uuid::Uuid::new_v4();
     let command = waku_client::Command::Start {
         options: waku_client::WireDriverStartOptions {
@@ -44,10 +48,19 @@ pub(crate) fn start_remote(
         Ok(_) => anyhow::bail!("Waku daemon returned an invalid start response"),
         Err(error) => return Err(error),
     };
-    connect_remote(client, session_id, runtime_id, supports_steer, None, events)
+    connect_remote(
+        daemon,
+        client,
+        session_id,
+        runtime_id,
+        supports_steer,
+        None,
+        events,
+    )
 }
 
 pub(crate) fn attach_remote(
+    daemon: waku_client::DaemonSupervisor,
     client: waku_client::DaemonClient,
     session_id: uuid::Uuid,
     runtime_id: uuid::Uuid,
@@ -56,6 +69,7 @@ pub(crate) fn attach_remote(
     events: DriverEventSender,
 ) -> anyhow::Result<DriverHandle> {
     connect_remote(
+        daemon,
         client,
         session_id,
         runtime_id,
@@ -66,84 +80,152 @@ pub(crate) fn attach_remote(
 }
 
 fn connect_remote(
-    client: waku_client::DaemonClient,
+    daemon: waku_client::DaemonSupervisor,
+    initial_client: waku_client::DaemonClient,
     session_id: uuid::Uuid,
     runtime_id: uuid::Uuid,
     supports_steer: bool,
     replay_cursor: Option<RuntimeEventCursor>,
     events: DriverEventSender,
 ) -> anyhow::Result<DriverHandle> {
-    let remote_events = client.subscribe(session_id, runtime_id);
+    let client_updates = daemon.subscribe_clients();
+    let active_client = Arc::new(Mutex::new(initial_client.clone()));
+    let forwarding_client = active_client.clone();
+    let closed = Arc::new(AtomicBool::new(false));
+    let forwarding_closed = closed.clone();
+    let (shutdown, forwarding_shutdown) = bounded(1);
     let forwarding_events = events.clone();
-    let thread_client = client.clone();
+    let thread_initial_client = initial_client.clone();
     let spawn = std::thread::Builder::new()
         .name(format!("waku-daemon-session-{session_id}"))
         .spawn(move || {
-            let mut saw_process_exit = false;
-            while let Ok(sequenced) = remote_events.recv() {
-                if replay_cursor.is_some_and(|cursor| {
-                    cursor.runtime_id == sequenced.runtime_id
-                        && cursor.epoch == sequenced.epoch
-                        && cursor.sequence >= sequenced.sequence
-                }) {
-                    continue;
-                }
-                let cursor = RuntimeEventCursor {
-                    runtime_id: sequenced.runtime_id,
-                    epoch: sequenced.epoch,
-                    sequence: sequenced.sequence,
-                };
-                let event = match waku_client::event_from_wire(sequenced.event) {
-                    Ok(event) => event,
-                    Err(error) => {
-                        DriverEvent::Error(format!("Waku daemon sent an invalid event: {error}"))
+            let mut client = thread_initial_client;
+            let mut remote_events = client.subscribe(session_id, runtime_id);
+            loop {
+                let disconnected = loop {
+                    select! {
+                        recv(forwarding_shutdown) -> _ => return,
+                        recv(remote_events) -> sequenced => {
+                            let Ok(sequenced) = sequenced else {
+                                break true;
+                            };
+                            if replay_cursor.is_some_and(|cursor| {
+                                cursor.runtime_id == sequenced.runtime_id
+                                    && cursor.epoch == sequenced.epoch
+                                    && cursor.sequence >= sequenced.sequence
+                            }) {
+                                continue;
+                            }
+                            let cursor = RuntimeEventCursor {
+                                runtime_id: sequenced.runtime_id,
+                                epoch: sequenced.epoch,
+                                sequence: sequenced.sequence,
+                            };
+                            let event = match waku_client::event_from_wire(sequenced.event) {
+                                Ok(event) => event,
+                                Err(error) => DriverEvent::Error(format!(
+                                    "Waku daemon sent an invalid event: {error}"
+                                )),
+                            };
+                            let process_exited = matches!(&event, DriverEvent::ProcessExited);
+                            if forwarding_events.send(event).is_err()
+                                || forwarding_events
+                                    .send(DriverEvent::RuntimeEventCursorAdvanced(cursor))
+                                    .is_err()
+                            {
+                                return;
+                            }
+                            if process_exited {
+                                break false;
+                            }
+                        }
                     }
                 };
-                saw_process_exit |= matches!(&event, DriverEvent::ProcessExited);
-                if forwarding_events.send(event).is_err()
-                    || forwarding_events
-                        .send(DriverEvent::RuntimeEventCursorAdvanced(cursor))
-                        .is_err()
-                {
+                client.unsubscribe(session_id, runtime_id);
+                if !disconnected || forwarding_closed.load(Ordering::Acquire) {
                     break;
                 }
-            }
-            thread_client.unsubscribe(session_id, runtime_id);
-            // A development hot-swap (or daemon crash) closes the old event
-            // channel. Surface that as an ordinary provider exit so the task
-            // cannot remain stuck in Working while the supervisor connects
-            // subsequent work to the replacement daemon.
-            if !saw_process_exit {
-                let _ = forwarding_events.send(DriverEvent::ProcessExited);
+
+                // A closed WebSocket says nothing about the provider process.
+                // Wait for the supervisor's next connection, then ask that
+                // daemon whether this exact runtime survived before changing
+                // the task status.
+                let replacement = loop {
+                    select! {
+                        recv(forwarding_shutdown) -> _ => return,
+                        recv(client_updates) -> replacement => {
+                            let Ok(replacement) = replacement else {
+                                return;
+                            };
+                            if !client.same_connection(&replacement) {
+                                break replacement;
+                            }
+                        }
+                    }
+                };
+                let attached = replacement.request(
+                    session_id,
+                    uuid::Uuid::nil(),
+                    waku_client::Command::AttachSession,
+                );
+                match attached {
+                    Ok(waku_client::ResponsePayload::SessionRuntime {
+                        runtime_id: Some(attached_runtime_id),
+                        ..
+                    }) if attached_runtime_id == runtime_id => {
+                        *forwarding_client.lock() = replacement.clone();
+                        client = replacement;
+                        remote_events = client.subscribe(session_id, runtime_id);
+                    }
+                    Ok(waku_client::ResponsePayload::SessionRuntime { .. }) => {
+                        let _ = forwarding_events.send(DriverEvent::ProcessExited);
+                        break;
+                    }
+                    Ok(_) => {
+                        let _ = forwarding_events.send(DriverEvent::Error(
+                            "Waku daemon returned an invalid runtime attachment response".into(),
+                        ));
+                        break;
+                    }
+                    Err(_) => {
+                        // This replacement also disappeared. Its client
+                        // channel will be followed by another supervisor
+                        // publication; keep the task live until one can answer
+                        // authoritatively.
+                        client = replacement;
+                    }
+                }
             }
         });
     if let Err(error) = spawn {
-        client.unsubscribe(session_id, runtime_id);
+        initial_client.unsubscribe(session_id, runtime_id);
         return Err(error.into());
     }
     Ok(DriverHandle::from_control(Arc::new(RemoteDriverControl {
-        client,
+        client: active_client,
         session_id,
         runtime_id,
         supports_steer,
         events,
+        closed,
+        shutdown,
     })))
 }
 
 struct RemoteDriverControl {
-    client: waku_client::DaemonClient,
+    client: Arc<Mutex<waku_client::DaemonClient>>,
     session_id: uuid::Uuid,
     runtime_id: uuid::Uuid,
     supports_steer: bool,
     events: DriverEventSender,
+    closed: Arc<AtomicBool>,
+    shutdown: Sender<()>,
 }
 
 impl RemoteDriverControl {
     fn notify(&self, command: waku_client::Command) {
-        if let Err(error) = self
-            .client
-            .notify(self.session_id, self.runtime_id, command)
-        {
+        let client = self.client.lock().clone();
+        if let Err(error) = client.notify(self.session_id, self.runtime_id, command) {
             let _ = self.events.send(DriverEvent::Error(format!(
                 "Waku daemon command failed: {error}"
             )));
@@ -205,6 +287,10 @@ impl DriverControl for RemoteDriverControl {
         });
     }
 
+    fn goal(&self, operation: waku_protocol::model::GoalOperation) {
+        self.notify(waku_client::Command::Goal { operation });
+    }
+
     fn run_computer_tool(&self, request: ComputerToolRequest) {
         self.notify(waku_client::Command::RunComputerTool {
             request: waku_client::WireComputerToolRequest {
@@ -240,8 +326,9 @@ impl DriverControl for RemoteDriverControl {
         let Ok(options) = options else {
             return false;
         };
+        let client = self.client.lock().clone();
         matches!(
-            self.client.request(
+            client.request(
                 self.session_id,
                 self.runtime_id,
                 waku_client::Command::ApplyOptions { options }
@@ -251,7 +338,8 @@ impl DriverControl for RemoteDriverControl {
     }
 
     fn rollback(&self, turns: usize) -> anyhow::Result<Option<ProviderResumeCursor>> {
-        match self.client.request(
+        let client = self.client.lock().clone();
+        match client.request(
             self.session_id,
             self.runtime_id,
             waku_client::Command::Rollback { turns },
@@ -265,7 +353,8 @@ impl DriverControl for RemoteDriverControl {
     }
 
     fn fork(&self, turns_to_remove: usize) -> anyhow::Result<ProviderResumeCursor> {
-        match self.client.request(
+        let client = self.client.lock().clone();
+        match client.request(
             self.session_id,
             self.runtime_id,
             waku_client::Command::Fork { turns_to_remove },
@@ -284,6 +373,9 @@ impl DriverControl for RemoteDriverControl {
 
 impl Drop for RemoteDriverControl {
     fn drop(&mut self) {
-        self.client.unsubscribe(self.session_id, self.runtime_id);
+        self.closed.store(true, Ordering::Release);
+        let _ = self.shutdown.try_send(());
+        let client = self.client.lock().clone();
+        client.unsubscribe(self.session_id, self.runtime_id);
     }
 }

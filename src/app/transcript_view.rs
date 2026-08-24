@@ -1,3 +1,4 @@
+use super::right_panel::{DiffRowStyle, render_diff_code_row};
 use super::*;
 use base64::Engine as _;
 
@@ -6,6 +7,12 @@ const CHANGED_FILES_PREVIEW_LIMIT: usize = 3;
 /// hundreds of files. The full immutable list remains one click away in the
 /// right panel.
 const CHANGED_FILES_EXPANDED_LIMIT: usize = 12;
+/// An expanded edit stays one transcript row tall; past this the diff scrolls
+/// in place, the same as long command output.
+const ACTIVITY_DIFF_MAX_HEIGHT: f32 = 400.0;
+/// Aligns a hunk separator with the line numbers in the rows below it; see
+/// `DiffRowStyle::ACTIVITY`.
+const ACTIVITY_DIFF_GUTTER_WIDTH: f32 = 52.0;
 
 #[derive(Clone, Debug)]
 struct ConversationNavigationRailSnapshot {
@@ -159,7 +166,7 @@ impl Waku {
     }
 
     pub(super) fn render_transcript(
-        &self,
+        &mut self,
         window: &mut Window,
         chat_viewport_width: f32,
         cx: &mut Context<Self>,
@@ -167,7 +174,30 @@ impl Waku {
         self.prefetch_checkpoint_refs(cx);
         self.sync_transcript_rows();
         self.sync_transcript_layout_width(window);
+        self.apply_pending_transcript_search_reveal(window, cx);
+        let search_bar = self.render_transcript_search_bar(chat_viewport_width, cx);
         let transcript_rows = self.active_transcript_rows().clone();
+        // A scrollbar drag owns the position for as long as it lasts, and the
+        // bar writes offsets straight into the list rather than through its
+        // scroll handler, so nothing else reports one. Release following as the
+        // thumb is taken — otherwise the pins below haul the view back on every
+        // frame of the drag — and hand back the same question a wheel scroll
+        // asks when the thumb is let go: did the reader come to rest on the
+        // tail?
+        let scrollbar_dragging = self.transcript_scrollbar.is_grabbed();
+        if self
+            .transcript_scrollbar_dragging
+            .replace(scrollbar_dragging)
+            != scrollbar_dragging
+        {
+            if scrollbar_dragging {
+                self.transcript_anchor_following.set(false);
+                self.transcript_is_scrolled.set(true);
+                self.transcript_tail_recheck.set(false);
+            } else {
+                self.transcript_tail_recheck.set(true);
+            }
+        }
         let anchor_end_space = self.update_transcript_anchor_end_space(window);
         if self.transcript_anchor_following.get()
             && anchor_end_space <= Pixels::ZERO
@@ -192,7 +222,23 @@ impl Waku {
             .checked_sub(1)
             .and_then(|last_row| transcript_rows.bounds_for_item(last_row))
             .map(|bounds| bounds.bottom());
-        let scroll_to_bottom = should_show_scroll_to_bottom(
+        // Scrolling back down onto the tail by hand re-engages following, just
+        // as the affordance below does. GPUI re-engages its own tail pin when a
+        // bottom-aligned list reaches the end, but a turn renders through the
+        // top-aligned anchored list and the pin there is ours, so without this
+        // the reader is stranded mid-stream after a round trip up and back —
+        // watching the reply grow past the bottom edge with no way but the
+        // button to rejoin it.
+        if self.transcript_tail_recheck.get()
+            && let Some(rests_at_tail) =
+                transcript_rests_at_tail(viewport_bottom, tail_bottom, anchor_end_space)
+        {
+            self.transcript_tail_recheck.set(false);
+            if rests_at_tail {
+                self.pin_transcript_to_tail();
+            }
+        }
+        let scroll_to_bottom_visible = should_show_scroll_to_bottom(
             self.transcript_is_scrolled.get(),
             self.transcript_anchor_following.get(),
             transcript_scrollable,
@@ -200,7 +246,10 @@ impl Waku {
             tail_bottom,
             anchor_end_space,
         )
-        .then(|| {
+        .unwrap_or_else(|| self.transcript_scroll_to_bottom_visible.get());
+        self.transcript_scroll_to_bottom_visible
+            .set(scroll_to_bottom_visible);
+        let scroll_to_bottom = scroll_to_bottom_visible.then(|| {
             let theme = Theme::current(cx);
             let focus = self.transcript_control_focus("transcript-scroll-to-bottom", cx);
             div()
@@ -283,11 +332,20 @@ impl Waku {
                     .size_full(),
             )
         });
+        let transcript_focus = self.transcript_focus.clone();
         div()
             .flex_1()
             .min_h_0()
             .w_full()
             .relative()
+            .key_context("Transcript")
+            .track_focus(&transcript_focus)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    window.focus(&this.transcript_focus, cx);
+                }),
+            )
             // Painted before any row, so the frame's selection registry holds
             // exactly the text elements this frame put on screen, in order.
             .child(md::render::frame_reset(self.transcript_selection.clone()))
@@ -310,16 +368,28 @@ impl Waku {
                 &self.transcript_scrollbar,
             ))
             .child(self.transcript_selection_input())
+            .children(search_bar)
             .into_any_element()
     }
 
     fn scroll_transcript_to_bottom(&mut self, cx: &mut Context<Self>) {
         self.sync_transcript_rows();
+        self.pin_transcript_to_tail();
+        cx.notify();
+    }
+
+    /// Re-engage tail following from wherever the transcript sits now.
+    ///
+    /// What actually survives a growing reply is GPUI's past-the-end anchor,
+    /// not the follow flag: `scroll_to_end` parks the list on `item_count`, and
+    /// the layout walks backwards from there, so the last row's bottom stays
+    /// against the viewport as that row grows. The flag alone only re-pins in
+    /// the phase where the anchor's end space has already collapsed to zero.
+    fn pin_transcript_to_tail(&self) {
         self.transcript_anchor_following
             .set(self.transcript_anchor.get().is_some());
         self.active_transcript_rows().scroll_to_end();
         self.transcript_is_scrolled.set(false);
-        cx.notify();
     }
 
     /// Copy the transcript's text selection.
@@ -546,8 +616,8 @@ impl Render for ConversationNavigationRail {
                     div()
                         .w_full()
                         .truncate()
-                        .text_size(px(14.0))
-                        .line_height(px(20.0))
+                        .text_size(sp(14.0))
+                        .line_height(sp(20.0))
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(theme.text)
                         .child(SharedString::from(turn.prompt.clone())),
@@ -559,8 +629,8 @@ impl Render for ConversationNavigationRail {
                             .max_h(px(60.0))
                             .overflow_hidden()
                             .whitespace_normal()
-                            .text_size(px(13.0))
-                            .line_height(px(20.0))
+                            .text_size(sp(13.0))
+                            .line_height(sp(20.0))
                             .text_color(theme.text_tertiary)
                             .child(SharedString::from(turn.response.clone())),
                     )
@@ -807,7 +877,73 @@ impl Waku {
         };
         self.toggle_block_disclosure(block_index, cx, |this| {
             this.expanded_activity_items.insert(id, !current);
+            if current {
+                // Collapsed: the rows would only be rebuilt from the same
+                // changes if it reopens, so do not keep them alive for every
+                // edit the session ever made.
+                this.activity_diffs.borrow_mut().remove(&id);
+                this.activity_diff_viewports.borrow_mut().remove(&id);
+            }
         });
+    }
+
+    /// Opens a file a tool changed in the right panel's viewer.
+    ///
+    /// Sits inside a row that toggles on click, so it stops the press from
+    /// reaching that toggle, and answers the keyboard on its own.
+    fn render_activity_open_file_button(
+        &self,
+        id: String,
+        path: String,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let focus = self.transcript_control_focus(id.clone(), cx);
+        let key_path = path.clone();
+        div()
+            .id(SharedString::from(id))
+            .track_focus(&focus)
+            .tab_index(0)
+            .size(px(20.0))
+            .flex_none()
+            .rounded(px(5.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_default()
+            .focus_visible(|button| button.bg(theme.overlay_strong))
+            .hover(|button| button.bg(theme.overlay_strong))
+            .child(icon(
+                "icons/file-bottom-left-arrow.svg",
+                14.0,
+                theme.text_ghost,
+            ))
+            .tooltip(Tooltip::text(tr!("activity.open_file")))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                this.open_activity_file(&path, cx);
+            }))
+            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                    this.open_activity_file(&key_path, cx);
+                    cx.stop_propagation();
+                }
+            }))
+            .into_any_element()
+    }
+
+    /// Diff rows for an expanded file-change activity, built on first sight and
+    /// held until the activity collapses or its changes are replaced.
+    fn activity_diff_rows(&self, activity: &ActivityItem) -> Rc<activity_diff::Diff> {
+        if let Some(diff) = self.activity_diffs.borrow().get(&activity.id) {
+            return diff.clone();
+        }
+        let diff = Rc::new(activity_diff::build(activity));
+        self.activity_diffs
+            .borrow_mut()
+            .insert(activity.id, diff.clone());
+        diff
     }
 
     pub(super) fn toggle_turn_fold(
@@ -871,6 +1007,12 @@ impl Waku {
         if !session.provider.supports_conversation_rollback() {
             return None;
         }
+        // A steer joins the running turn as another user message. Rewinding
+        // restores the turn's checkpoint and resubmits the prompt that opened
+        // it, so only that prompt can carry the affordance.
+        if !message_opens_turn(&session.messages, message_index) {
+            return None;
+        }
         let retained_turn_count = turn.turn_count.saturating_sub(1);
         // Cache only — the ref lives in git, and this runs for every visible
         // user message on every frame. `prefetch_checkpoint_refs` fills the
@@ -890,6 +1032,7 @@ impl Waku {
         }
         Some(UserMessageAction {
             session_id: session.id,
+            message_id: message.id,
             turn_count: turn.turn_count,
         })
     }
@@ -988,6 +1131,18 @@ impl Waku {
             enabled: pending_turn.is_none(),
             preparing: pending_turn == Some(turn.turn_count),
         })
+    }
+
+    /// `metrics` rescaled to the user's UI and code font size settings.
+    pub(super) fn scaled_markdown_metrics(&self, metrics: MarkdownMetrics) -> MarkdownMetrics {
+        metrics.scaled(self.state.ui_font_size, self.state.code_font_size)
+    }
+
+    /// Mono text scale for plain tool-output sections: the code font size
+    /// itself, the way every dedicated code surface takes it.
+    fn activity_mono_text(&self) -> (f32, f32) {
+        let size = self.state.code_font_size;
+        (size, (size * 1.5 * 2.0).round() / 2.0)
     }
 
     /// The markdown render context for one transcript row. Element keys are
@@ -1101,7 +1256,7 @@ impl Waku {
                             .as_ref()
                             .filter(|edit| {
                                 edit.session_id == action.session_id
-                                    && edit.turn_count == action.turn_count
+                                    && edit.message_id == action.message_id
                             })
                             .map(|edit| edit.input.clone())
                     });
@@ -1133,18 +1288,22 @@ impl Waku {
                         .collect();
                     let attachments_can_reveal = !self.daemon.is_remote();
                     let menu = self.menu_handle(format!("message-{}", message.id), cx);
-                    let metrics = if message.role == MessageRole::User {
+                    let metrics = self.scaled_markdown_metrics(if message.role == MessageRole::User
+                    {
                         MarkdownMetrics::USER_MESSAGE
                     } else {
                         MarkdownMetrics::BODY
-                    };
+                    });
                     let animate_streaming = message.streaming && !cx.reduce_motion();
-                    let ctx = self.markdown_ctx(
+                    let mut ctx = self.markdown_ctx(
                         format!("message-{}", message.id),
                         &palette,
                         metrics,
                         animate_streaming,
                     );
+                    if let Some(highlights) = self.transcript_search_highlights(message_index) {
+                        ctx = ctx.with_search_highlights(highlights);
+                    }
                     // Human and assistant messages share the Markdown path.
                     // Parse only visible rows rather than doing work for every
                     // driver delta or every off-screen prompt.
@@ -1293,7 +1452,7 @@ impl Waku {
             .items_center()
             .gap(px(5.0))
             .cursor_default()
-            .text_size(px(11.5))
+            .text_size(sp(12.5))
             .font_weight(FontWeight::MEDIUM)
             .text_color(theme.text_secondary)
             .focus_visible(|style| style.border_color(theme.accent))
@@ -1357,7 +1516,7 @@ impl Waku {
                             .child(
                                 div()
                                     .truncate()
-                                    .text_size(px(12.5))
+                                    .text_size(sp(12.5))
                                     .font_weight(FontWeight::MEDIUM)
                                     .text_color(theme.text)
                                     .child(title),
@@ -1367,8 +1526,8 @@ impl Waku {
                                     .flex()
                                     .items_center()
                                     .gap(px(6.0))
-                                    .text_size(px(11.0))
-                                    .line_height(px(14.0))
+                                    .text_size(sp(12.5))
+                                    .line_height(sp(14.0))
                                     .child(
                                         div()
                                             .text_color(theme.success)
@@ -1408,7 +1567,7 @@ impl Waku {
                             .min_w_0()
                             .flex_1()
                             .truncate()
-                            .text_size(px(11.5))
+                            .text_size(sp(12.5))
                             .text_color(theme.text_secondary)
                             .tooltip(Tooltip::text(file.path.clone()))
                             .child(file.path.clone()),
@@ -1416,14 +1575,14 @@ impl Waku {
                     .child(
                         div()
                             .flex_none()
-                            .text_size(px(10.5))
+                            .text_size(sp(12.5))
                             .text_color(theme.success)
                             .child(format!("+{}", file.additions)),
                     )
                     .child(
                         div()
                             .flex_none()
-                            .text_size(px(10.5))
+                            .text_size(sp(12.5))
                             .text_color(theme.danger)
                             .child(format!("-{}", file.deletions)),
                     ),
@@ -1457,7 +1616,7 @@ impl Waku {
                     .items_center()
                     .gap(px(6.0))
                     .cursor_default()
-                    .text_size(px(11.5))
+                    .text_size(sp(12.5))
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(theme.text_secondary)
                     .focus_visible(|style| style.bg(theme.overlay_strong))
@@ -1533,8 +1692,8 @@ impl Waku {
                     .items_center()
                     .gap(px(5.0))
                     .cursor_default()
-                    .text_size(px(11.5))
-                    .line_height(px(16.0))
+                    .text_size(sp(13.5))
+                    .line_height(sp(18.0))
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(theme.text_tertiary)
                     .child(SharedString::from(label))
@@ -1544,7 +1703,7 @@ impl Waku {
                         } else {
                             "icons/chevron-right.svg"
                         },
-                        10.0,
+                        11.5,
                         theme.text_tertiary,
                     ))
                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -1574,8 +1733,8 @@ impl Waku {
             .child(working_wave_dots(theme.text_tertiary))
             .child(
                 div()
-                    .text_size(px(11.5))
-                    .line_height(px(16.0))
+                    .text_size(sp(13.5))
+                    .line_height(sp(18.0))
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(theme.text_tertiary)
                     .child(SharedString::from(tr!(
@@ -1619,19 +1778,30 @@ impl Waku {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let live_turn = self
-            .selected_session()
-            .and_then(AgentSession::active_turn_id)
-            .is_some_and(|turn_id| {
-                self.selected_transcript_blocks()
-                    .get(block_index)
-                    .is_some_and(|block| block.turn_id == Some(turn_id))
-            });
+        // A completed child is not a group boundary: providers commonly emit
+        // the next tool after the previous result. The group leaves the live
+        // tail only when answer text is appended (so `after_message` falls
+        // behind) or when the turn itself settles.
+        let live_group = self.selected_session().is_some_and(|session| {
+            session
+                .transcript_blocks
+                .get(block_index)
+                .is_some_and(|block| {
+                    activity_group_is_live(
+                        session
+                            .active_turn_id()
+                            .is_some_and(|turn_id| block.turn_id == Some(turn_id)),
+                        block_index + 1 == session.transcript_blocks.len(),
+                        block.after_message,
+                        session.messages.len(),
+                    )
+                })
+        });
         let expanded = self
             .activities_expanded
             .get(&block_index)
             .copied()
-            .unwrap_or(live_turn);
+            .unwrap_or(live_group);
         let live_reasoning_id = (self
             .selected_runtime()
             .is_some_and(|runtime| runtime.stream_phase == Some(StreamPhase::Reasoning))
@@ -1647,7 +1817,7 @@ impl Waku {
                 .map(|activity| activity.id)
         })
         .flatten();
-        let header_title = activity_header_title(activities, live_turn, live_reasoning_id);
+        let header_title = activity_header_title(activities, live_group, live_reasoning_id);
         let header_focus =
             self.transcript_control_focus(format!("activity-toggle-{block_index}"), cx);
         let cluster = div()
@@ -1667,8 +1837,8 @@ impl Waku {
                     .flex()
                     .items_center()
                     .gap(px(6.0))
-                    .text_size(px(12.5))
-                    .line_height(px(16.0))
+                    .text_size(sp(12.5))
+                    .line_height(sp(16.0))
                     .cursor_default()
                     .focus_visible(|style| style.text_color(theme.text))
                     .hover(|style| style.text_color(theme.text))
@@ -1744,7 +1914,7 @@ impl Waku {
                     .flex()
                     .items_center()
                     .cursor_default()
-                    .text_size(px(9.5))
+                    .text_size(sp(12.5))
                     .text_color(color)
                     .focus_visible(|style| style.border_color(theme.accent))
                     .hover(|style| style.bg(theme.overlay_strong))
@@ -1779,9 +1949,25 @@ impl Waku {
                 row_detail = preview;
             }
             let file_change_stats = activity_file_change_stats(activity);
+            // One changed file is unambiguous, so the row itself can offer to
+            // open it. A change touching several names each file in the diff
+            // below, and each of those rows opens its own.
+            let open_file_button = match activity.file_changes.as_slice() {
+                [change] if activity.kind == ActivityKind::FileChange => {
+                    Some(self.render_activity_open_file_button(
+                        format!("activity-open-{id}"),
+                        change.path.clone(),
+                        theme,
+                        cx,
+                    ))
+                }
+                _ => None,
+            };
+            let shows_diff = reasoning.is_none() && activity_shows_diff(activity);
             let has_detail = reasoning
                 .is_some_and(|reasoning| !reasoning.content.trim().is_empty())
-                || !sections.is_empty();
+                || !sections.is_empty()
+                || shows_diff;
             let item_expanded = has_detail
                 && self
                     .expanded_activity_items
@@ -1814,8 +2000,8 @@ impl Waku {
                         .when(!item_expanded, |element| {
                             element.rounded_bl(px(8.0)).rounded_br(px(8.0))
                         })
-                        .text_size(px(12.0))
-                        .line_height(px(16.0))
+                        .text_size(sp(12.5))
+                        .line_height(sp(16.0))
                         .when(has_detail, |element| {
                             element
                                 .track_focus(&item_focus)
@@ -1862,6 +2048,7 @@ impl Waku {
                             )
                         })
                         .children(background_badge)
+                        .children(open_file_button)
                         .when(has_detail, |element| {
                             element.child(icon(
                                 if item_expanded {
@@ -1908,7 +2095,7 @@ impl Waku {
                 let ctx = self.markdown_ctx(
                     format!("reasoning-{id}"),
                     &palette,
-                    MarkdownMetrics::COMPACT,
+                    self.scaled_markdown_metrics(MarkdownMetrics::COMPACT),
                     reasoning_live && !cx.reduce_motion(),
                 );
                 let reasoning_viewport = self
@@ -1940,7 +2127,7 @@ impl Waku {
                     // The reasoning dissolve rides the half-rate lease: fast
                     // thinking keeps a fade active for the whole phase, every
                     // tick rebuilds each visible transcript row, and 15 fps
-                    // alpha on the dim 11.5px peek is indistinguishable. The
+                    // alpha on the dim compact peek is indistinguishable. The
                     // answer text keeps the full-rate dissolve.
                     motion::pulse_lease_slow(window.current_view(), cx);
                 }
@@ -1990,14 +2177,30 @@ impl Waku {
                         .child(activity_scroll_guard(reasoning_viewport, reasoning_live)),
                 );
             }
-            if item_expanded && reasoning.is_none() {
+            if item_expanded && shows_diff {
+                let diff = self.activity_diff_rows(activity);
+                if !diff.is_empty() {
+                    item = item.child(self.render_activity_diff(
+                        id,
+                        &diff,
+                        activity_surface,
+                        theme,
+                        cx,
+                    ));
+                }
+            }
+            if item_expanded
+                && reasoning.is_none()
+                && (!sections.is_empty() || !activity.image_urls.is_empty())
+            {
                 let palette = MarkdownPalette::from_theme(theme);
                 let ctx = self.markdown_ctx(
                     format!("activity-{id}"),
                     &palette,
-                    MarkdownMetrics::COMPACT,
+                    self.scaled_markdown_metrics(MarkdownMetrics::COMPACT),
                     false,
                 );
+                let (mono_size, mono_line) = self.activity_mono_text();
                 let mut detail_card = div()
                     .w_full()
                     .min_w_0()
@@ -2009,8 +2212,8 @@ impl Waku {
                     .flex_col()
                     .gap(px(8.0))
                     .font_family(md::render::MONO_FAMILY)
-                    .text_size(px(10.5))
-                    .line_height(px(16.0))
+                    .text_size(px(mono_size))
+                    .line_height(px(mono_line))
                     .text_color(theme.text_secondary)
                     .whitespace_normal()
                     .overflow_hidden();
@@ -2113,8 +2316,6 @@ impl Waku {
                                             .track_scroll(&output_viewport.scroll_handle)
                                             .py(px(4.0))
                                             .pr(px(8.0))
-                                            .text_size(px(10.5))
-                                            .line_height(px(16.0))
                                             .child(md::render::plain_text(
                                                 content.clone(),
                                                 md::render::MONO_FAMILY,
@@ -2156,8 +2357,6 @@ impl Waku {
                                 div()
                                     .w_full()
                                     .min_w_0()
-                                    .text_size(px(10.5))
-                                    .line_height(px(16.0))
                                     .child(md::render::plain_text(
                                         content.clone(),
                                         md::render::MONO_FAMILY,
@@ -2186,6 +2385,211 @@ impl Waku {
         }
         cluster.child(items).into_any_element()
     }
+
+    /// The diff for an expanded file-change activity.
+    ///
+    /// Rows bleed to the card's edges so a changed line reads as a band, and
+    /// the whole diff sits in the same capped, faded viewport as command
+    /// output — a large edit stays one transcript row tall.
+    fn render_activity_diff(
+        &self,
+        id: Uuid,
+        diff: &activity_diff::Diff,
+        surface: Hsla,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let viewport = self
+            .activity_diff_viewports
+            .borrow_mut()
+            .entry(id)
+            .or_default()
+            .clone();
+        let wheel_scroll = viewport.scroll_handle.clone();
+        let (diff_mono_size, diff_mono_line) = self.activity_mono_text();
+        let mut rows = div()
+            .id(SharedString::from(format!("activity-diff-scroll-{id}")))
+            .w_full()
+            .min_w_0()
+            .max_h(px(ACTIVITY_DIFF_MAX_HEIGHT))
+            .overflow_y_scroll()
+            .track_scroll(&viewport.scroll_handle)
+            .flex()
+            .flex_col()
+            .font_family(md::render::MONO_FAMILY)
+            .text_size(px(diff_mono_size))
+            .line_height(px(diff_mono_line))
+            .on_scroll_wheel(move |_, _, cx| contain_scroll(&wheel_scroll, cx));
+        for (index, line) in diff.snapshot.lines.iter().enumerate() {
+            rows = rows.child(self.render_activity_diff_row(
+                id,
+                index,
+                line,
+                &diff.snapshot,
+                theme,
+                cx,
+            ));
+        }
+        if diff.hidden_rows > 0 {
+            let note = if diff.hidden_rows == 1 {
+                tr!("diff.rows_hidden_one")
+            } else {
+                tr!("diff.rows_hidden", count = diff.hidden_rows)
+            };
+            rows = rows.child(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .px(px(12.0))
+                    .py(px(4.0))
+                    .text_color(theme.text_tertiary)
+                    .child(SharedString::from(note)),
+            );
+        }
+        div()
+            .w_full()
+            .min_w_0()
+            .relative()
+            .max_h(px(ACTIVITY_DIFF_MAX_HEIGHT))
+            .overflow_hidden()
+            .border_t_1()
+            .border_color(theme.border_strong)
+            .child(rows)
+            .child(activity_scroll_fade(
+                viewport.scroll_handle.clone(),
+                ActivityScrollFadeSide::Top,
+                surface,
+            ))
+            .child(activity_scroll_fade(
+                viewport.scroll_handle.clone(),
+                ActivityScrollFadeSide::Bottom,
+                surface,
+            ))
+            .child(scrollbar::vertical(
+                &viewport.scroll_handle,
+                &viewport.scrollbar,
+            ))
+            .into_any_element()
+    }
+
+    fn render_activity_diff_row(
+        &self,
+        id: Uuid,
+        index: usize,
+        line: &crate::review_diff::Line,
+        snapshot: &crate::review_diff::Snapshot,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        use crate::review_diff::LineKind;
+
+        match &line.kind {
+            LineKind::FileHeader => {
+                let Some(file) = snapshot.files.get(line.file_index) else {
+                    return div().into_any_element();
+                };
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .h(px(24.0))
+                    .pl(px(10.0))
+                    .pr(px(6.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .bg(theme.overlay)
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .text_color(theme.text_secondary)
+                    .font_weight(FontWeight::MEDIUM)
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .truncate()
+                            .child(SharedString::from(file.path.clone())),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .font_weight(FontWeight::NORMAL)
+                            .text_color(theme.success)
+                            .child(SharedString::from(format!("+{}", file.additions))),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .font_weight(FontWeight::NORMAL)
+                            .text_color(theme.danger)
+                            .child(SharedString::from(format!("-{}", file.deletions))),
+                    )
+                    .child(self.render_activity_open_file_button(
+                        format!("activity-diff-open-{id}-{}", line.file_index),
+                        file.path.clone(),
+                        theme,
+                        cx,
+                    ))
+                    .into_any_element()
+            }
+            // Unchanged lines the provider left out of its patch. Nothing was
+            // withheld locally, so this marks the break rather than offering
+            // to expand it the way the Review panel does.
+            LineKind::Gap(gap) => activity_diff_break_row(
+                Some(tr!("diff.unmodified_lines", count = gap.count())),
+                theme,
+            ),
+            LineKind::HunkHeader | LineKind::Meta => activity_diff_break_row(
+                (!line.content.is_empty()).then(|| line.content.clone()),
+                theme,
+            ),
+            LineKind::Context | LineKind::Addition | LineKind::Deletion => render_diff_code_row(
+                line,
+                index,
+                &format!("activity-diff-{id}"),
+                &self.transcript_selection,
+                DiffRowStyle::activity(self.state.code_font_size),
+                theme,
+            ),
+        }
+    }
+}
+
+/// The separator between two hunks of the same file.
+fn activity_diff_break_row(label: Option<String>, theme: &Theme) -> AnyElement {
+    div()
+        .w_full()
+        .min_w_0()
+        .h(px(20.0))
+        .flex_none()
+        .flex()
+        .items_center()
+        .font_family(md::render::MONO_FAMILY)
+        // Fixed like the Review panel's gap and hunk captions: a caption in
+        // the code surface follows neither font setting.
+        .text_size(px(12.5))
+        .bg(theme.overlay)
+        .text_color(theme.text_ghost)
+        .child(
+            div()
+                .w(px(ACTIVITY_DIFF_GUTTER_WIDTH))
+                .flex_none()
+                .self_stretch()
+                .flex()
+                .items_center()
+                .justify_center()
+                .border_r_1()
+                .border_color(theme.border)
+                .child("⋯"),
+        )
+        .children(label.map(|label| {
+            div()
+                .min_w_0()
+                .pl(px(12.0))
+                .truncate()
+                .child(SharedString::from(label))
+        }))
+        .into_any_element()
 }
 
 #[derive(Clone, Copy)]
@@ -2228,7 +2632,11 @@ fn live_reasoning_window_anchor(cached: usize, content: &str) -> usize {
     // A restarted block can leave the cached start past the end of the new
     // content or inside a multibyte character; either way the window is
     // stale (`is_char_boundary` is false past the end too), so restart it.
-    let cached = if content.is_char_boundary(cached) { cached } else { 0 };
+    let cached = if content.is_char_boundary(cached) {
+        cached
+    } else {
+        0
+    };
     if content.len() - cached <= LIVE_REASONING_WINDOW_MAX {
         return cached;
     }

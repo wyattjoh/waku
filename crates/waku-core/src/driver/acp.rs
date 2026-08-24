@@ -16,7 +16,8 @@ use agent_client_protocol::schema::v1::{
     CancelNotification, ClientCapabilities, ContentBlock, Implementation, InitializeRequest,
     InitializeResponse, LoadSessionRequest, NewSessionRequest, PermissionOptionKind, PromptRequest,
     PromptResponse, RequestId, RequestPermissionOutcome, RequestPermissionRequest,
-    RequestPermissionResponse, ResumeSessionRequest, SelectedPermissionOutcome, SessionId,
+    RequestPermissionResponse, ResumeSessionRequest, SelectedPermissionOutcome, SessionConfigKind,
+    SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOptions, SessionId,
     SessionModeId, SessionModeState, SessionNotification, SetSessionConfigOptionRequest,
     SetSessionModeRequest, StopReason, TextContent,
 };
@@ -26,7 +27,7 @@ use agent_client_protocol::{
 };
 use anyhow::{Context as _, anyhow};
 use parking_lot::Mutex;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use super::activity;
 use crate::driver::{
@@ -55,6 +56,7 @@ enum CommandMessage {
 
 pub struct AcpDriver {
     commands: smol::channel::Sender<CommandMessage>,
+    supports_steer: bool,
     mode: RuntimeMode,
     interaction_mode: InteractionMode,
     computer_use: Option<super::support::HeadlessComputerUseRuntime>,
@@ -66,15 +68,31 @@ struct AcpLaunch {
     env: Vec<(String, String)>,
 }
 
-fn launch_for(provider: ProviderKind) -> anyhow::Result<AcpLaunch> {
+fn launch_for(provider: ProviderKind, reasoning_effort: Option<&str>) -> anyhow::Result<AcpLaunch> {
     match provider {
         ProviderKind::Cursor => Ok(AcpLaunch {
             args: vec!["acp".into()],
             env: Vec::new(),
         }),
-        ProviderKind::Grok => Ok(AcpLaunch {
-            args: vec!["agent".into(), "stdio".into()],
-            env: vec![("GROK_OAUTH2_REFERRER".into(), "waku".into())],
+        ProviderKind::Grok => {
+            let mut args = vec!["agent".into()];
+            if let Some(effort) = reasoning_effort.filter(|effort| !effort.is_empty()) {
+                args.push("--reasoning-effort".into());
+                args.push(effort.to_owned());
+            }
+            args.push("stdio".into());
+            Ok(AcpLaunch {
+                args,
+                env: vec![("GROK_OAUTH2_REFERRER".into(), "waku".into())],
+            })
+        }
+        ProviderKind::Fx => Ok(AcpLaunch {
+            args: vec!["acp".into()],
+            env: Vec::new(),
+        }),
+        ProviderKind::Kimi => Ok(AcpLaunch {
+            args: vec!["acp".into()],
+            env: Vec::new(),
         }),
         ProviderKind::OpenCode => Ok(AcpLaunch {
             args: vec!["acp".into()],
@@ -125,7 +143,7 @@ impl AcpDriver {
             None => None,
         };
 
-        let launch = launch_for(provider)?;
+        let launch = launch_for(provider, reasoning_effort.as_deref())?;
         let computer_use = (provider == ProviderKind::Grok && computer_use_enabled)
             .then(|| super::support::HeadlessComputerUseRuntime::start(provider, events.clone()))
             .transpose()?;
@@ -181,6 +199,7 @@ impl AcpDriver {
 
         Ok(Self {
             commands,
+            supports_steer: provider != ProviderKind::Fx,
             mode,
             interaction_mode,
             computer_use,
@@ -335,7 +354,12 @@ async fn run_sdk_connection(
                 let stream_state = stream_state.clone();
                 async move |notification: SessionNotification, _connection| {
                     if !suppress_session_updates.load(Ordering::Acquire) {
-                        handle_session_update(notification, &events, &mut stream_state.lock())?;
+                        handle_session_update(
+                            provider,
+                            notification,
+                            &events,
+                            &mut stream_state.lock(),
+                        )?;
                     }
                     Ok(())
                 }
@@ -442,15 +466,24 @@ async fn run_sdk_connection(
             agent_client_protocol::on_receive_request!(),
         )
         .connect_with(agent, async move |connection: ConnectionTo<Agent>| {
+            let mut client_capabilities = ClientCapabilities::new().terminal(false);
+            if provider == ProviderKind::Cursor {
+                // Cursor only exposes its parameterized model controls to
+                // clients that opt in. Waku applies the returned config option
+                // ids rather than assuming Cursor's private ids stay stable.
+                let mut meta = Map::new();
+                meta.insert("parameterizedModelPicker".to_owned(), Value::Bool(true));
+                client_capabilities = client_capabilities.meta(meta);
+            }
             let initialize = connection
                 .send_request(
                     InitializeRequest::new(ProtocolVersion::V1)
-                        .client_capabilities(ClientCapabilities::new().terminal(false))
+                        .client_capabilities(client_capabilities)
                         .client_info(Implementation::new("waku", env!("CARGO_PKG_VERSION"))),
                 )
                 .block_task()
                 .await?;
-            let (session_id, modes) = establish_session(
+            let (session_id, modes, config_options) = establish_session(
                 &connection,
                 &initialize,
                 resume_session_id.as_deref(),
@@ -459,7 +492,7 @@ async fn run_sdk_connection(
             )
             .await?;
 
-            if let Some(mode_id) = desired_mode(modes.as_ref(), mode, interaction_mode) {
+            if let Some(mode_id) = desired_mode(provider, modes.as_ref(), mode, interaction_mode) {
                 // Mode selection is opportunistic: an agent can advertise a
                 // mode but reject a later transition without invalidating the
                 // session itself.
@@ -477,11 +510,14 @@ async fn run_sdk_connection(
             });
 
             let mut current_model = model;
+            let mut current_effort = reasoning_effort;
             apply_model(
                 &connection,
+                provider,
                 &session_id,
+                config_options.as_deref(),
                 current_model.as_deref(),
-                reasoning_effort.as_deref(),
+                current_effort.as_deref(),
                 &events,
             )
             .await;
@@ -507,6 +543,7 @@ async fn run_sdk_connection(
                             &native_session_id,
                             grok_title_home.clone(),
                             title_refresh.clone(),
+                            stream_state.clone(),
                         ) {
                             let _ = events.send(DriverEvent::Error(error.to_string()));
                             let _ = events.send(DriverEvent::TurnFinished {
@@ -536,6 +573,7 @@ async fn run_sdk_connection(
                             &native_session_id,
                             grok_title_home.clone(),
                             title_refresh.clone(),
+                            stream_state.clone(),
                         ) {
                             Ok(()) => {
                                 let _ = events.send(DriverEvent::SteerAccepted { message: text });
@@ -583,13 +621,19 @@ async fn run_sdk_connection(
                         }
                     }
                     CommandMessage::Options(options) => {
-                        if options.model != current_model {
+                        if options.model != current_model
+                            || (provider == ProviderKind::Grok
+                                && options.reasoning_effort != current_effort)
+                        {
                             current_model = options.model;
+                            current_effort = options.reasoning_effort;
                             apply_model(
                                 &connection,
+                                provider,
                                 &session_id,
+                                config_options.as_deref(),
                                 current_model.as_deref(),
-                                options.reasoning_effort.as_deref(),
+                                current_effort.as_deref(),
                                 &events,
                             )
                             .await;
@@ -611,7 +655,11 @@ async fn establish_session(
     resume_session_id: Option<&str>,
     cwd: &Path,
     suppress_session_updates: &AtomicBool,
-) -> agent_client_protocol::Result<(SessionId, Option<SessionModeState>)> {
+) -> agent_client_protocol::Result<(
+    SessionId,
+    Option<SessionModeState>,
+    Option<Vec<SessionConfigOption>>,
+)> {
     if let Some(existing) = resume_session_id {
         if initialize
             .agent_capabilities
@@ -623,7 +671,11 @@ async fn establish_session(
                 .block_task()
                 .await
         {
-            return Ok((SessionId::new(existing.to_owned()), response.modes));
+            return Ok((
+                SessionId::new(existing.to_owned()),
+                response.modes,
+                response.config_options,
+            ));
         }
 
         if initialize.agent_capabilities.load_session {
@@ -634,7 +686,11 @@ async fn establish_session(
                 .await;
             suppress_session_updates.store(false, Ordering::Release);
             if let Ok(response) = response {
-                return Ok((SessionId::new(existing.to_owned()), response.modes));
+                return Ok((
+                    SessionId::new(existing.to_owned()),
+                    response.modes,
+                    response.config_options,
+                ));
             }
         }
     }
@@ -643,30 +699,294 @@ async fn establish_session(
         .send_request(NewSessionRequest::new(cwd))
         .block_task()
         .await?;
-    Ok((response.session_id, response.modes))
+    Ok((response.session_id, response.modes, response.config_options))
 }
 
 fn desired_mode(
+    provider: ProviderKind,
     modes: Option<&SessionModeState>,
     mode: RuntimeMode,
     interaction_mode: InteractionMode,
 ) -> Option<SessionModeId> {
-    if interaction_mode != InteractionMode::Plan && mode != RuntimeMode::Plan {
-        return None;
-    }
     let modes = modes?;
-    let plan = modes
+    let desired = if provider == ProviderKind::Fx {
+        if mode == RuntimeMode::Ask {
+            "ask"
+        } else {
+            "code"
+        }
+    } else {
+        if interaction_mode != InteractionMode::Plan && mode != RuntimeMode::Plan {
+            return None;
+        }
+        "plan"
+    };
+    let desired = modes
         .available_modes
         .iter()
-        .find(|mode| mode.id.to_string().eq_ignore_ascii_case("plan"))?
+        .find(|mode| mode.id.to_string().eq_ignore_ascii_case(desired))?
         .id
         .clone();
-    (modes.current_mode_id != plan).then_some(plan)
+    (modes.current_mode_id != desired).then_some(desired)
+}
+
+/// Which session config option carries reasoning effort. ACP leaves the id to
+/// the agent: Kimi Code exposes it as its `thinking` level, while the other
+/// agents Waku drives keep it on `mode`. Grok does not use this path: its
+/// effort rides on `session/set_model` as `_meta.reasoningEffort`.
+fn reasoning_effort_config_id(provider: ProviderKind) -> &'static str {
+    match provider {
+        ProviderKind::Kimi => "thinking",
+        _ => "mode",
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct CursorModelSelection {
+    value: String,
+    suffix: String,
+}
+
+fn session_config_select_values(option: &SessionConfigOption) -> Vec<&str> {
+    let SessionConfigKind::Select(select) = &option.kind else {
+        return Vec::new();
+    };
+    match &select.options {
+        SessionConfigSelectOptions::Ungrouped(options) => options
+            .iter()
+            .map(|option| option.value.0.as_ref())
+            .collect(),
+        SessionConfigSelectOptions::Grouped(groups) => groups
+            .iter()
+            .flat_map(|group| group.options.iter())
+            .map(|option| option.value.0.as_ref())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn cursor_model_aliases(requested: &str) -> Vec<String> {
+    let mut aliases = vec![requested.to_owned()];
+    if let Some(alias) = requested.strip_prefix("cursor-") {
+        aliases.push(alias.to_owned());
+    }
+
+    // Cursor's CLI spells a few aliases as `claude-4.6-sonnet-*`, while ACP
+    // advertises the same family as `claude-sonnet-4-6`.
+    if let Some(rest) = requested.strip_prefix("claude-")
+        && let Some((version, family_and_suffix)) = rest.split_once('-')
+    {
+        let (family, suffix) = family_and_suffix
+            .split_once('-')
+            .map_or((family_and_suffix, ""), |(family, suffix)| (family, suffix));
+        if matches!(family, "haiku" | "opus" | "sonnet") {
+            let mut alias = format!("claude-{family}-{}", version.replace('.', "-"));
+            if !suffix.is_empty() {
+                alias.push('-');
+                alias.push_str(suffix);
+            }
+            if !aliases.contains(&alias) {
+                aliases.push(alias);
+            }
+        }
+    }
+    aliases
+}
+
+/// Resolves Cursor's CLI-facing model aliases against the base values its
+/// parameterized ACP picker advertises. The unconsumed suffix carries values
+/// such as `thinking`, `xhigh`, and `fast` for the dynamic options returned
+/// after the base model changes.
+fn cursor_model_selection(
+    option: &SessionConfigOption,
+    requested: &str,
+) -> Option<CursorModelSelection> {
+    let values = session_config_select_values(option);
+    let aliases = cursor_model_aliases(requested);
+
+    for alias in &aliases {
+        if let Some(value) = values.iter().find(|value| **value == alias) {
+            return Some(CursorModelSelection {
+                value: (*value).to_owned(),
+                suffix: String::new(),
+            });
+        }
+    }
+    if requested == "auto"
+        && let Some(value) = values.iter().find(|value| **value == "default")
+    {
+        return Some(CursorModelSelection {
+            value: (*value).to_owned(),
+            suffix: String::new(),
+        });
+    }
+
+    aliases
+        .iter()
+        .flat_map(|alias| {
+            values.iter().filter_map(move |value| {
+                alias
+                    .strip_prefix(*value)
+                    .and_then(|suffix| suffix.strip_prefix('-'))
+                    .map(|suffix| CursorModelSelection {
+                        value: (*value).to_owned(),
+                        suffix: suffix.to_owned(),
+                    })
+            })
+        })
+        .max_by_key(|selection| selection.value.len())
+}
+
+fn cursor_suffix_has(suffix: &str, value: &str) -> bool {
+    suffix.split('-').any(|part| part == value)
+}
+
+fn cursor_desired_select_value(
+    option: &SessionConfigOption,
+    selection: &CursorModelSelection,
+    reasoning_effort: Option<&str>,
+) -> Option<String> {
+    let values = session_config_select_values(option);
+    match option.category.as_ref()? {
+        SessionConfigOptionCategory::ThoughtLevel => {
+            if let Some(effort) = reasoning_effort
+                && values.contains(&effort)
+            {
+                return Some(effort.to_owned());
+            }
+            if selection.suffix.contains("extra-high") && values.contains(&"xhigh") {
+                return Some("xhigh".to_owned());
+            }
+            values
+                .iter()
+                .find(|value| cursor_suffix_has(&selection.suffix, value))
+                .map(|value| (*value).to_owned())
+        }
+        SessionConfigOptionCategory::ModelConfig => {
+            let id = option.id.to_string().to_ascii_lowercase();
+            let enabled = match id.as_str() {
+                "fast" => cursor_suffix_has(&selection.suffix, "fast"),
+                "thinking" => cursor_suffix_has(&selection.suffix, "thinking"),
+                _ => return None,
+            };
+            let value = if enabled { "true" } else { "false" };
+            values.contains(&value).then(|| value.to_owned())
+        }
+        _ => None,
+    }
+}
+
+fn session_config_current_value(option: &SessionConfigOption) -> Option<&str> {
+    let SessionConfigKind::Select(select) = &option.kind else {
+        return None;
+    };
+    Some(select.current_value.0.as_ref())
+}
+
+async fn apply_cursor_variant_configs(
+    connection: &ConnectionTo<Agent>,
+    session_id: &SessionId,
+    mut options: Vec<SessionConfigOption>,
+    selection: &CursorModelSelection,
+    reasoning_effort: Option<&str>,
+) -> agent_client_protocol::Result<()> {
+    // Thinking can reveal a thought-level option, so apply it first and use
+    // each response's refreshed option set for the next selection.
+    for target in ["thinking", "thought_level", "fast"] {
+        let Some(option) = options.iter().find(|option| match target {
+            "thinking" => {
+                option.category == Some(SessionConfigOptionCategory::ModelConfig)
+                    && option.id.to_string().eq_ignore_ascii_case("thinking")
+            }
+            "thought_level" => option.category == Some(SessionConfigOptionCategory::ThoughtLevel),
+            "fast" => {
+                option.category == Some(SessionConfigOptionCategory::ModelConfig)
+                    && option.id.to_string().eq_ignore_ascii_case("fast")
+            }
+            _ => false,
+        }) else {
+            continue;
+        };
+        let Some(value) = cursor_desired_select_value(option, selection, reasoning_effort) else {
+            continue;
+        };
+        if session_config_current_value(option) == Some(value.as_str()) {
+            continue;
+        }
+        let config_id = option.id.clone();
+        options = connection
+            .send_request(SetSessionConfigOptionRequest::new(
+                session_id.clone(),
+                config_id,
+                value.as_str(),
+            ))
+            .block_task()
+            .await?
+            .config_options;
+    }
+    Ok(())
+}
+
+fn find_config_option(
+    config_options: &[SessionConfigOption],
+    category: SessionConfigOptionCategory,
+) -> Option<&SessionConfigOption> {
+    config_options
+        .iter()
+        .find(|option| option.category.as_ref() == Some(&category))
+}
+
+fn fx_model_option(config_options: &[SessionConfigOption]) -> Option<&SessionConfigOption> {
+    config_options.iter().find(|option| {
+        option.category == Some(SessionConfigOptionCategory::Model)
+            && option.id.to_string().eq_ignore_ascii_case("model")
+    })
+}
+
+fn fx_model_provider_switch<'a>(
+    config_options: &'a [SessionConfigOption],
+    model: &str,
+) -> Option<(&'a SessionConfigOption, &'static str)> {
+    if fx_model_option(config_options)
+        .is_some_and(|option| session_config_select_values(option).contains(&model))
+    {
+        return None;
+    }
+    // Fx scopes model options to the selected account route. AI Gateway IDs
+    // are provider/model pairs, while subscription IDs are flat. Selecting the
+    // Gateway route returns a refreshed model option that contains these IDs.
+    if !model.contains('/') {
+        return None;
+    }
+    let provider = config_options.iter().find(|option| {
+        option.category == Some(SessionConfigOptionCategory::Model)
+            && option.id.to_string().eq_ignore_ascii_case("provider")
+    })?;
+    (session_config_current_value(provider) != Some("gateway")
+        && session_config_select_values(provider).contains(&"gateway"))
+    .then_some((provider, "gateway"))
+}
+
+fn set_model_params(
+    session_id: &SessionId,
+    model: &str,
+    reasoning_effort: Option<&str>,
+    provider: ProviderKind,
+) -> serde_json::Value {
+    let mut params = json!({"sessionId": session_id, "modelId": model});
+    if provider == ProviderKind::Grok
+        && let Some(effort) = reasoning_effort.filter(|effort| !effort.is_empty())
+    {
+        params["_meta"] = json!({"reasoningEffort": effort});
+    }
+    params
 }
 
 async fn apply_model(
     connection: &ConnectionTo<Agent>,
+    provider: ProviderKind,
     session_id: &SessionId,
+    config_options: Option<&[SessionConfigOption]>,
     model: Option<&str>,
     reasoning_effort: Option<&str>,
     events: &DriverEventSender,
@@ -674,9 +994,108 @@ async fn apply_model(
     let Some(model) = model else {
         return;
     };
+    let cursor_model_option = (provider == ProviderKind::Cursor)
+        .then_some(config_options)
+        .flatten()
+        .and_then(|options| find_config_option(options, SessionConfigOptionCategory::Model));
+    if let Some(option) = cursor_model_option
+        && let Some(selection) = cursor_model_selection(option, model)
+    {
+        match connection
+            .send_request(SetSessionConfigOptionRequest::new(
+                session_id.clone(),
+                option.id.clone(),
+                selection.value.as_str(),
+            ))
+            .block_task()
+            .await
+        {
+            Ok(response) => {
+                if let Err(error) = apply_cursor_variant_configs(
+                    connection,
+                    session_id,
+                    response.config_options,
+                    &selection,
+                    reasoning_effort,
+                )
+                .await
+                {
+                    let _ = events.send(DriverEvent::Error(tr!(
+                        "errors.select_model",
+                        error = error
+                    )));
+                }
+            }
+            Err(error) => {
+                let _ = events.send(DriverEvent::Error(tr!(
+                    "errors.select_model",
+                    error = error
+                )));
+            }
+        }
+        return;
+    }
+
+    if provider == ProviderKind::Fx {
+        let mut options = config_options.unwrap_or_default().to_vec();
+        if let Some((provider_option, value)) = fx_model_provider_switch(&options, model) {
+            let config_id = provider_option.id.clone();
+            match connection
+                .send_request(SetSessionConfigOptionRequest::new(
+                    session_id.clone(),
+                    config_id,
+                    value,
+                ))
+                .block_task()
+                .await
+            {
+                Ok(response) => options = response.config_options,
+                Err(error) => {
+                    let _ = events.send(DriverEvent::Error(tr!(
+                        "errors.select_model",
+                        error = error
+                    )));
+                    return;
+                }
+            }
+        }
+        let Some(option) = fx_model_option(&options) else {
+            let _ = events.send(DriverEvent::Error(tr!(
+                "errors.select_model",
+                error = "Fx did not advertise its model configuration"
+            )));
+            return;
+        };
+        if !session_config_select_values(option).contains(&model) {
+            let _ = events.send(DriverEvent::Error(tr!(
+                "errors.select_model",
+                error = format!("Fx did not advertise model {model}")
+            )));
+            return;
+        }
+        if let Err(error) = connection
+            .send_request(SetSessionConfigOptionRequest::new(
+                session_id.clone(),
+                option.id.clone(),
+                model,
+            ))
+            .block_task()
+            .await
+        {
+            let _ = events.send(DriverEvent::Error(tr!(
+                "errors.select_model",
+                error = error
+            )));
+        }
+        return;
+    }
+
+    // Grok, Kimi, OpenCode, and Cursor agents that do not advertise a model
+    // config option retain the legacy request unchanged. Fx intentionally
+    // stays on session/set_config_option, its documented model API.
     let request = match UntypedMessage::new(
         "session/set_model",
-        json!({"sessionId": session_id, "modelId": model}),
+        set_model_params(session_id, model, reasoning_effort, provider),
     ) {
         Ok(request) => request,
         Err(error) => {
@@ -694,13 +1113,15 @@ async fn apply_model(
         )));
         return;
     }
-    if let Some(effort) = reasoning_effort {
+    if provider != ProviderKind::Grok
+        && let Some(effort) = reasoning_effort
+    {
         // Reasoning effort is an optional config extension and is deliberately
         // non-fatal when an agent does not expose it.
         let _ = connection
             .send_request(SetSessionConfigOptionRequest::new(
                 session_id.clone(),
-                "mode",
+                reasoning_effort_config_id(provider),
                 effort,
             ))
             .block_task()
@@ -719,7 +1140,13 @@ fn send_prompt(
     native_session_id: &str,
     grok_title_home: Option<std::path::PathBuf>,
     title_refresh: super::title_refresh::NativeTitleRefresh,
+    stream_state: Arc<Mutex<AcpStreamState>>,
 ) -> agent_client_protocol::Result<()> {
+    stream_state.lock().produced_content = false;
+    // Read before the turn runs, so the failure lookup cannot mistake an
+    // earlier turn's record for this one's.
+    let wire_offset = (provider == ProviderKind::Kimi)
+        .then(|| crate::kimi_session::wire_offset(native_session_id));
     let extension_id =
         (provider == ProviderKind::Grok).then(|| format!("waku-{}", uuid::Uuid::new_v4()));
     let mut request = PromptRequest::new(
@@ -745,7 +1172,12 @@ fn send_prompt(
     let native_session_id = native_session_id.to_owned();
     let registered = sent.on_receiving_result(async move |result| {
         if settle_prompt_request(&callback_requests, &callback_request_id) {
-            let success = finish_prompt(result, &callback_events);
+            // Only an empty turn pays for this lookup, so a healthy turn never
+            // waits on Kimi's records.
+            let native_failure = wire_offset
+                .filter(|_| !stream_state.lock().produced_content)
+                .and_then(|offset| crate::kimi_session::turn_failure(&native_session_id, offset));
+            let success = finish_prompt(result, native_failure, &callback_events);
             if provider == ProviderKind::Grok && success {
                 start_grok_title_refresh(
                     grok_title_home.as_deref(),
@@ -790,7 +1222,7 @@ fn finish_xai_prompt_complete(
         Some("refusal") => StopReason::Refusal,
         _ => StopReason::EndTurn,
     };
-    finish_prompt(Ok(PromptResponse::new(stop_reason)), events).then(|| session_id.to_owned())
+    finish_prompt(Ok(PromptResponse::new(stop_reason)), None, events).then(|| session_id.to_owned())
 }
 
 fn start_grok_title_refresh(
@@ -823,6 +1255,7 @@ fn start_grok_title_refresh(
 
 fn finish_prompt(
     result: agent_client_protocol::Result<PromptResponse>,
+    native_failure: Option<String>,
     events: &impl DriverEventSink,
 ) -> bool {
     let response = match result {
@@ -836,6 +1269,18 @@ fn finish_prompt(
             return false;
         }
     };
+    // An agent can end a turn cleanly and still have failed upstream. Where
+    // that failure is recoverable from the provider's own records, it outranks
+    // the protocol's verdict: reporting success here would show the user an
+    // empty answer and no reason for it.
+    if let Some(failure) = native_failure {
+        let _ = events.send(DriverEvent::Error(failure));
+        let _ = events.send(DriverEvent::TurnFinished {
+            success: false,
+            summary: None,
+        });
+        return false;
+    }
     let (success, summary) = match response.stop_reason {
         StopReason::EndTurn | StopReason::Cancelled => (true, None),
         StopReason::MaxTokens => (false, Some(tr!("session.agent_ran_out_of_context"))),
@@ -1192,12 +1637,36 @@ fn handle_permission_request(
 }
 
 fn handle_session_update(
+    provider: ProviderKind,
     notification: SessionNotification,
     events: &impl DriverEventSink,
     state: &mut AcpStreamState,
 ) -> agent_client_protocol::Result<()> {
     let update = serde_json::to_value(notification.update)?;
-    match update.get("sessionUpdate").and_then(Value::as_str) {
+    let kind = update.get("sessionUpdate").and_then(Value::as_str);
+    if provider == ProviderKind::Fx
+        && !state.produced_content
+        && kind == Some("agent_message_chunk")
+        && update
+            .pointer("/content/text")
+            .and_then(Value::as_str)
+            .is_some_and(fx_context_notice)
+    {
+        return Ok(());
+    }
+    if matches!(
+        kind,
+        Some(
+            "agent_message_chunk"
+                | "agent_thought_chunk"
+                | "tool_call"
+                | "tool_call_update"
+                | "plan"
+        )
+    ) {
+        state.produced_content = true;
+    }
+    match kind {
         Some("agent_message_chunk") => {
             if let Some(text) = update
                 .pointer("/content/text")
@@ -1282,9 +1751,17 @@ fn handle_session_update(
     Ok(())
 }
 
+fn fx_context_notice(text: &str) -> bool {
+    text.starts_with("[context] ") || text.starts_with("skill discovery warning: ")
+}
+
 #[derive(Default)]
 struct AcpStreamState {
     tools: HashMap<String, (ActivityKind, String)>,
+    /// Whether the running turn has produced anything visible. A turn that
+    /// ends having produced nothing is the shape a swallowed provider error
+    /// takes, which is what makes a native failure worth looking up.
+    produced_content: bool,
 }
 
 /// Pull the agent's explanation out of a permission request's tool call.
@@ -1389,7 +1866,7 @@ impl DriverControl for AcpDriver {
     }
 
     fn supports_steer(&self) -> bool {
-        true
+        self.supports_steer
     }
 
     fn steer(&self, prompt: String) {
@@ -1447,8 +1924,27 @@ impl Drop for AcpDriver {
 mod tests {
     use super::*;
     use agent_client_protocol::schema::v1::{
-        SessionMode, SessionModeState, ToolCallUpdate, ToolCallUpdateFields,
+        SessionConfigSelectOption, SessionMode, SessionModeState, ToolCallUpdate,
+        ToolCallUpdateFields,
     };
+
+    fn select_config_option(
+        id: &str,
+        category: SessionConfigOptionCategory,
+        current: &str,
+        values: &[&str],
+    ) -> SessionConfigOption {
+        SessionConfigOption::select(
+            id.to_owned(),
+            id.to_owned(),
+            current.to_owned(),
+            values
+                .iter()
+                .map(|value| SessionConfigSelectOption::new((*value).to_owned(), *value))
+                .collect::<Vec<_>>(),
+        )
+        .category(category)
+    }
 
     #[test]
     fn cursor_question_response_uses_native_scalar_and_array_answers() {
@@ -1564,17 +2060,185 @@ mod tests {
             ],
         );
         assert_eq!(
-            desired_mode(Some(&modes), RuntimeMode::FullAccess, InteractionMode::Plan)
-                .map(|mode| mode.to_string()),
+            desired_mode(
+                ProviderKind::Cursor,
+                Some(&modes),
+                RuntimeMode::FullAccess,
+                InteractionMode::Plan
+            )
+            .map(|mode| mode.to_string()),
             Some("plan".to_owned())
         );
         assert!(
             desired_mode(
+                ProviderKind::Cursor,
                 Some(&modes),
                 RuntimeMode::FullAccess,
                 InteractionMode::Build
             )
             .is_none()
+        );
+    }
+
+    #[test]
+    fn fx_access_mode_selects_ask_or_code() {
+        let modes = SessionModeState::new(
+            "code",
+            vec![
+                SessionMode::new("ask", "Ask before sensitive actions"),
+                SessionMode::new("code", "Review sensitive actions automatically"),
+            ],
+        );
+        assert_eq!(
+            desired_mode(
+                ProviderKind::Fx,
+                Some(&modes),
+                RuntimeMode::Ask,
+                InteractionMode::Build
+            )
+            .map(|mode| mode.to_string()),
+            Some("ask".to_owned())
+        );
+        assert!(
+            desired_mode(
+                ProviderKind::Fx,
+                Some(&modes),
+                RuntimeMode::FullAccess,
+                InteractionMode::Build
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn fx_launches_its_documented_acp_subcommand() {
+        let launch = launch_for(ProviderKind::Fx, None).unwrap();
+        assert_eq!(launch.args, ["acp"]);
+        assert!(launch.env.is_empty());
+    }
+
+    #[test]
+    fn fx_model_option_ignores_provider_selector_in_same_category() {
+        let provider = select_config_option(
+            "provider",
+            SessionConfigOptionCategory::Model,
+            "gateway",
+            &["gateway", "codex", "grok"],
+        );
+        let model = select_config_option(
+            "model",
+            SessionConfigOptionCategory::Model,
+            "openai/gpt-5.6-sol",
+            &["openai/gpt-5.6-sol", "anthropic/claude-sonnet-5"],
+        );
+
+        assert_eq!(
+            fx_model_option(&[provider, model]).map(|option| option.id.to_string()),
+            Some("model".to_owned())
+        );
+    }
+
+    #[test]
+    fn fx_gateway_model_selects_the_gateway_route_first() {
+        let provider = select_config_option(
+            "provider",
+            SessionConfigOptionCategory::Model,
+            "codex",
+            &["gateway", "codex", "grok"],
+        );
+        let model = select_config_option(
+            "model",
+            SessionConfigOptionCategory::Model,
+            "gpt-5.6-luna",
+            &["gpt-5.6-sol", "gpt-5.6-luna"],
+        );
+        let options = [provider, model];
+
+        let (option, value) =
+            fx_model_provider_switch(&options, "openai/gpt-5.6-luna-fast").unwrap();
+        assert_eq!(option.id.to_string(), "provider");
+        assert_eq!(value, "gateway");
+    }
+
+    #[test]
+    fn cursor_model_aliases_resolve_to_advertised_parameterized_picker_values() {
+        let option = select_config_option(
+            "model",
+            SessionConfigOptionCategory::Model,
+            "default",
+            &["default", "grok-4.6", "composer-2.5", "claude-sonnet-4-6"],
+        );
+
+        assert_eq!(
+            cursor_model_selection(&option, "auto"),
+            Some(CursorModelSelection {
+                value: "default".into(),
+                suffix: String::new(),
+            })
+        );
+        assert_eq!(
+            cursor_model_selection(&option, "composer-2.5"),
+            Some(CursorModelSelection {
+                value: "composer-2.5".into(),
+                suffix: String::new(),
+            })
+        );
+        assert_eq!(
+            cursor_model_selection(&option, "cursor-grok-4.6-xhigh-fast"),
+            Some(CursorModelSelection {
+                value: "grok-4.6".into(),
+                suffix: "xhigh-fast".into(),
+            })
+        );
+        assert_eq!(
+            cursor_model_selection(&option, "claude-4.6-sonnet-medium-thinking"),
+            Some(CursorModelSelection {
+                value: "claude-sonnet-4-6".into(),
+                suffix: "medium-thinking".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn cursor_model_suffix_selects_dynamic_effort_thinking_and_fast_options() {
+        let selection = CursorModelSelection {
+            value: "claude-opus-5".into(),
+            suffix: "thinking-extra-high-fast".into(),
+        };
+        let effort = select_config_option(
+            "effort",
+            SessionConfigOptionCategory::ThoughtLevel,
+            "high",
+            &["low", "medium", "high", "xhigh"],
+        );
+        let thinking = select_config_option(
+            "thinking",
+            SessionConfigOptionCategory::ModelConfig,
+            "false",
+            &["false", "true"],
+        );
+        let fast = select_config_option(
+            "fast",
+            SessionConfigOptionCategory::ModelConfig,
+            "false",
+            &["false", "true"],
+        );
+
+        assert_eq!(
+            cursor_desired_select_value(&effort, &selection, None).as_deref(),
+            Some("xhigh")
+        );
+        assert_eq!(
+            cursor_desired_select_value(&thinking, &selection, None).as_deref(),
+            Some("true")
+        );
+        assert_eq!(
+            cursor_desired_select_value(&fast, &selection, None).as_deref(),
+            Some("true")
+        );
+        assert_eq!(
+            cursor_desired_select_value(&effort, &selection, Some("low")).as_deref(),
+            Some("low")
         );
     }
 
@@ -1635,11 +2299,37 @@ mod tests {
         assert!(event_rx.try_recv().is_err());
     }
 
+    /// Kimi ends a failed turn with `end_turn` and no content at all, so the
+    /// provider's own record is the only thing that can name the cause.
+    #[test]
+    fn a_recovered_provider_failure_overrides_a_clean_stop_reason() {
+        let (events, event_rx) = crossbeam_channel::unbounded();
+
+        assert!(!finish_prompt(
+            Ok(PromptResponse::new(StopReason::EndTurn)),
+            Some("402 membership inactive".to_owned()),
+            &events
+        ));
+
+        assert!(matches!(
+            event_rx.try_recv().unwrap(),
+            DriverEvent::Error(message) if message == "402 membership inactive"
+        ));
+        assert!(matches!(
+            event_rx.try_recv().unwrap(),
+            DriverEvent::TurnFinished {
+                success: false,
+                summary: None
+            }
+        ));
+    }
+
     #[test]
     fn typed_prompt_response_settles_the_turn() {
         let (events, event_rx) = crossbeam_channel::unbounded();
         assert!(finish_prompt(
             Ok(PromptResponse::new(StopReason::EndTurn)),
+            None,
             &events
         ));
         assert!(matches!(
@@ -1664,8 +2354,13 @@ mod tests {
         ];
         for update in updates {
             let update = serde_json::from_value(update).unwrap();
-            handle_session_update(SessionNotification::new("s", update), &events, &mut state)
-                .unwrap();
+            handle_session_update(
+                ProviderKind::Cursor,
+                SessionNotification::new("s", update),
+                &events,
+                &mut state,
+            )
+            .unwrap();
         }
 
         let seen = event_rx.try_iter().collect::<Vec<_>>();
@@ -1684,6 +2379,60 @@ mod tests {
                 context_window: Some(500000),
             }
         ));
+    }
+
+    #[test]
+    fn fx_context_notices_do_not_become_assistant_text() {
+        let (events, event_rx) = crossbeam_channel::unbounded();
+        let mut state = AcpStreamState::default();
+        for text in [
+            "[context] skill catalog omitted 19 entries",
+            "skill discovery warning: candidate was skipped",
+            "Hi! How can I help?",
+            "[context] is ordinary text after the answer starts",
+        ] {
+            let update = serde_json::from_value(json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": text}
+            }))
+            .unwrap();
+            handle_session_update(
+                ProviderKind::Fx,
+                SessionNotification::new("s", update),
+                &events,
+                &mut state,
+            )
+            .unwrap();
+        }
+
+        let seen = event_rx.try_iter().collect::<Vec<_>>();
+        assert_eq!(seen.len(), 2);
+        assert!(matches!(&seen[0], DriverEvent::TextDelta(text) if text == "Hi! How can I help?"));
+        assert!(matches!(&seen[1], DriverEvent::TextDelta(text) if text.starts_with("[context]")));
+        assert!(state.produced_content);
+    }
+
+    #[test]
+    fn grok_launch_passes_reasoning_effort_before_stdio() {
+        let launch = launch_for(ProviderKind::Grok, Some("xhigh")).unwrap();
+        assert_eq!(
+            launch.args,
+            ["agent", "--reasoning-effort", "xhigh", "stdio"]
+        );
+        let bare = launch_for(ProviderKind::Grok, None).unwrap();
+        assert_eq!(bare.args, ["agent", "stdio"]);
+    }
+
+    #[test]
+    fn grok_set_model_includes_reasoning_effort_meta() {
+        let params = set_model_params(
+            &SessionId::new("sess"),
+            "grok-4.6",
+            Some("xhigh"),
+            ProviderKind::Grok,
+        );
+        assert_eq!(params["modelId"], "grok-4.6");
+        assert_eq!(params["_meta"]["reasoningEffort"], "xhigh");
     }
 
     #[test]
@@ -1758,5 +2507,134 @@ mod tests {
             }
         }
         assert_eq!(finished, Some(true));
+    }
+
+    /// Covers Cursor's provider-private parameterized picker with a model id
+    /// whose CLI alias carries both effort and fast-mode values.
+    #[test]
+    #[ignore = "requires an installed, authenticated cursor-agent"]
+    fn cursor_parameterized_model_selection_finishes_a_real_turn() {
+        let binary = crate::command_env::find_executable("cursor-agent")
+            .expect("cursor-agent is not installed");
+        let (events, event_rx) = crate::driver::test_event_channel();
+        let driver = AcpDriver::start(
+            ProviderKind::Cursor,
+            DriverStartOptions {
+                binary,
+                cwd: std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")),
+                mode: RuntimeMode::FullAccess,
+                interaction_mode: InteractionMode::Build,
+                model: Some("cursor-grok-4.6-xhigh".into()),
+                reasoning_effort: None,
+                service_tier: None,
+                context_window: None,
+                agent_preset: None,
+                computer_use_enabled: false,
+                provider_cursor: None,
+            },
+            events,
+        )
+        .expect("the ACP session should open");
+
+        loop {
+            let event = event_rx
+                .recv_timeout(Duration::from_secs(60))
+                .expect("the agent should report its session");
+            match event {
+                DriverEvent::Connected {
+                    provider_cursor: Some(ProviderResumeCursor::Cursor { .. }),
+                } => break,
+                DriverEvent::Error(error) => panic!("the agent reported: {error}"),
+                _ => {}
+            }
+        }
+        driver.prompt("Reply exactly OK.".into());
+
+        let mut produced_text = false;
+        let mut finished = None;
+        while let Ok(event) = event_rx.recv_timeout(Duration::from_secs(120)) {
+            match event {
+                DriverEvent::TextDelta(text) => produced_text |= !text.is_empty(),
+                DriverEvent::TurnFinished { success, .. } => {
+                    finished = Some(success);
+                    break;
+                }
+                DriverEvent::Error(error) => panic!("the agent reported: {error}"),
+                _ => {}
+            }
+        }
+        assert!(produced_text, "the Cursor turn produced no text");
+        assert_eq!(finished, Some(true));
+    }
+
+    /// The invariant Kimi's silent failures break: a turn may finish
+    /// successfully or report why it did not, but it must never claim success
+    /// having produced nothing at all. Holds whether or not the account is
+    /// currently able to serve the request.
+    #[test]
+    #[ignore = "requires an installed, authenticated kimi"]
+    fn kimi_never_reports_an_empty_turn_as_a_success() {
+        let binary = crate::command_env::find_executable("kimi").expect("kimi is not installed");
+        let (events, event_rx) = crate::driver::test_event_channel();
+        let driver = AcpDriver::start(
+            ProviderKind::Kimi,
+            DriverStartOptions {
+                binary,
+                cwd: std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")),
+                mode: RuntimeMode::FullAccess,
+                interaction_mode: InteractionMode::Build,
+                model: None,
+                reasoning_effort: None,
+                service_tier: None,
+                context_window: None,
+                agent_preset: None,
+                computer_use_enabled: false,
+                provider_cursor: None,
+            },
+            events,
+        )
+        .expect("the ACP session should open");
+
+        loop {
+            let event = event_rx
+                .recv_timeout(Duration::from_secs(60))
+                .expect("the agent should report its session");
+            match event {
+                DriverEvent::Connected {
+                    provider_cursor: Some(ProviderResumeCursor::Kimi { .. }),
+                } => break,
+                DriverEvent::Error(error) => panic!("the agent reported: {error}"),
+                _ => {}
+            }
+        }
+        driver.prompt("Say hi in three words.".into());
+
+        let mut produced_content = false;
+        let mut reported_error = None;
+        let mut finished = None;
+        while let Ok(event) = event_rx.recv_timeout(Duration::from_secs(120)) {
+            match event {
+                DriverEvent::TextDelta(_) | DriverEvent::ReasoningDelta(_) => {
+                    produced_content = true;
+                }
+                DriverEvent::Error(error) => reported_error = Some(error),
+                DriverEvent::TurnFinished { success, .. } => {
+                    finished = Some(success);
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        match finished.expect("the turn should settle") {
+            true => assert!(
+                produced_content,
+                "the turn was reported successful without producing anything"
+            ),
+            false => assert!(
+                reported_error.is_some_and(|error| !error.trim().is_empty()),
+                "the turn failed without naming a reason"
+            ),
+        }
     }
 }

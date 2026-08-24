@@ -4,11 +4,13 @@ import type {
   AgentSession,
   BranchSnapshot,
   ComposerDraft,
+  GoalOperation,
   MessageAttachment,
   PlanUsage,
   Project,
   ProviderModel,
   ProviderProbe,
+  ThreadGoalStatus,
 } from '@waku/client'
 import {
   useEffect,
@@ -21,6 +23,7 @@ import {
 import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso'
 import { toast } from 'sonner'
 import { ControlMenu, type ControlMenuItem } from '@/components/control-menu'
+import { GoalDialog, goalStatusClass, goalUsageReadout } from '@/components/goal-dialog'
 import { DaemonFilePicker } from '@/components/daemon-file-picker'
 import { PreviewableImage } from '@/components/image-preview'
 import { ModelPicker } from '@/components/model-picker'
@@ -50,6 +53,7 @@ import {
   expandedComposerSubmission,
   isFastModeToggleSubmission,
   mergeComposerCommands,
+  parseGoalSubmission,
   replaceComposerTrigger,
   toggledFastServiceTier,
   type ComposerAutocompleteRow,
@@ -156,6 +160,7 @@ export function Composer({
   const queryClient = useQueryClient()
   const {
     sendPrompt,
+    sendGoalOperation,
     steerPrompt,
     cancel,
     respond,
@@ -172,6 +177,9 @@ export function Composer({
   const composerFiles = useComposerFiles(cwd)
   const composerCommands = useComposerCommands(session.provider, cwd)
   const [prompt, setPrompt] = useState(initialComposerDraft?.text ?? '')
+  const [goalDialog, setGoalDialog] = useState<{ prefill: string | null; replace: boolean } | null>(
+    null,
+  )
   const [attachments, setAttachments] = useState<MessageAttachment[]>(
     () => initialComposerDraft?.attachments ?? [],
   )
@@ -228,11 +236,17 @@ export function Composer({
         composerFiles.data ?? [],
       )
     : []
-  const autocompleteOpen = Boolean(
+  const autocompleteLoading = autocompleteTrigger?.kind === 'command'
+    ? composerCommands.isPending || composerCommands.isFetching
+    : autocompleteTrigger?.kind === 'file'
+      ? composerFiles.isPending || composerFiles.isFetching
+      : false
+  const autocompleteVisible = Boolean(
     autocompleteKey
       && autocompleteKey !== dismissedAutocomplete
-      && autocompleteRows.length,
+      && (autocompleteRows.length || autocompleteLoading),
   )
+  const autocompleteOpen = autocompleteVisible && autocompleteRows.length > 0
 
   function clearEscapeStop() {
     if (escapeStopTimer.current !== null) window.clearTimeout(escapeStopTimer.current)
@@ -341,7 +355,11 @@ export function Composer({
     submittedPrompt: string,
     submittedAttachments: MessageAttachment[],
   ): string | undefined {
-    const expanded = expandedComposerSubmission(submittedPrompt.trim(), availableCommands)
+    const expanded = expandedComposerSubmission(
+      session.provider,
+      submittedPrompt.trim(),
+      availableCommands,
+    )
     if (expanded === null) return undefined
     return [
       expanded,
@@ -350,6 +368,17 @@ export function Composer({
   }
 
   function executeLocalComposerCommand(submittedPrompt = prompt): boolean {
+    return executeFastModeToggle(submittedPrompt) || executeGoalCommand(submittedPrompt)
+  }
+
+  function clearComposerDraft() {
+    setPrompt('')
+    setCursor(0)
+    setDismissedAutocomplete(null)
+    setAutocompleteSelection({ key: '', index: 0 })
+  }
+
+  function executeFastModeToggle(submittedPrompt: string): boolean {
     if (!isFastModeToggleSubmission(session.provider, submittedPrompt, availableCommands)) return false
     const nextTier = toggledFastServiceTier(
       session.service_tier,
@@ -357,12 +386,53 @@ export function Composer({
     )
     if (!nextTier) return false
     const enabled = nextTier !== 'default'
-    setPrompt('')
-    setCursor(0)
-    setDismissedAutocomplete(null)
-    setAutocompleteSelection({ key: '', index: 0 })
+    clearComposerDraft()
     savePatch({ service_tier: nextTier })
     toast.success(t(enabled ? 'commands.fast_enabled' : 'commands.fast_disabled'))
+    return true
+  }
+
+  function dispatchGoal(operation: GoalOperation) {
+    void sendGoalOperation(session, operation).catch((error) => toast.error(errorMessage(error)))
+  }
+
+  /** Codex's native `/goal` command, bridged to app-server without starting a
+   * turn. The runtime context starts the provider itself when none is live yet,
+   * so a goal can be set before the first message. */
+  function executeGoalCommand(submittedPrompt: string): boolean {
+    const command = parseGoalSubmission(session.provider, submittedPrompt, availableCommands)
+    if (!command) return false
+    const goal = session.thread_goal ?? null
+    switch (command.kind) {
+      case 'show':
+      case 'edit':
+        setGoalDialog({ prefill: null, replace: false })
+        break
+      case 'pause':
+        dispatchGoal({ kind: 'set', objective: null, status: 'paused', replace: false })
+        break
+      case 'resume':
+        dispatchGoal({ kind: 'set', objective: null, status: 'active', replace: false })
+        break
+      case 'clear':
+        dispatchGoal({ kind: 'clear' })
+        break
+      case 'set':
+        if (goal && goal.status !== 'complete' && goal.status !== 'budgetLimited') {
+          // Replacing unfinished work needs a look at what it replaces; the
+          // dialog carries the confirmation.
+          setGoalDialog({ prefill: command.objective, replace: true })
+        } else {
+          dispatchGoal({
+            kind: 'set',
+            objective: command.objective,
+            status: 'active',
+            replace: Boolean(goal),
+          })
+        }
+        break
+    }
+    clearComposerDraft()
     return true
   }
 
@@ -505,6 +575,11 @@ export function Composer({
   }
 
   function keyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
+    if (autocompleteVisible && event.key === 'Escape') {
+      event.preventDefault()
+      setDismissedAutocomplete(autocompleteKey)
+      return
+    }
     if (autocompleteOpen) {
       if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
         event.preventDefault()
@@ -517,11 +592,6 @@ export function Composer({
       ) {
         event.preventDefault()
         acceptAutocomplete()
-        return
-      }
-      if (event.key === 'Escape') {
-        event.preventDefault()
-        setDismissedAutocomplete(autocompleteKey)
         return
       }
     }
@@ -621,10 +691,11 @@ export function Composer({
         />
 
         <div className="relative">
-          {autocompleteOpen && (
+          {autocompleteVisible && (
             <ComposerAutocomplete
               highlight={autocompleteHighlight}
               listRef={autocompleteList}
+              loading={autocompleteLoading && autocompleteRows.length === 0}
               rows={autocompleteRows}
               t={t}
               onAccept={acceptAutocomplete}
@@ -659,8 +730,8 @@ export function Composer({
             </div>
           )}
             <Textarea
-              aria-controls={autocompleteOpen ? 'composer-autocomplete' : undefined}
-              aria-expanded={autocompleteOpen}
+              aria-controls={autocompleteVisible ? 'composer-autocomplete' : undefined}
+              aria-expanded={autocompleteVisible}
               aria-label={t('composer.message')}
               aria-activedescendant={autocompleteOpen
                 ? `composer-autocomplete-${autocompleteHighlight}`
@@ -727,6 +798,11 @@ export function Composer({
             />
             <AccessControl returnFocus={composerInput} session={session} onPatch={savePatch} />
             <InteractionModeControl session={session} onPatch={savePatch} />
+            <GoalControl
+              busy={busy}
+              session={session}
+              onOpen={() => setGoalDialog({ prefill: null, replace: false })}
+            />
             <div className="flex-1" />
             <div className="flex items-center gap-2">
               {busy && (
@@ -793,6 +869,29 @@ export function Composer({
             onSelect={addDaemonFile}
           />
         )}
+        <GoalDialog
+          open={goalDialog !== null}
+          prefill={goalDialog?.prefill ?? null}
+          replace={goalDialog?.replace ?? false}
+          returnFocus={composerInput}
+          session={session}
+          onClear={() => dispatchGoal({ kind: 'clear' })}
+          onOpenChange={(open) => {
+            if (!open) setGoalDialog(null)
+          }}
+          onSetStatus={(status: ThreadGoalStatus) => dispatchGoal({
+            kind: 'set',
+            objective: null,
+            status,
+            replace: false,
+          })}
+          onSubmit={(objective, status, replace) => dispatchGoal({
+            kind: 'set',
+            objective,
+            status,
+            replace,
+          })}
+        />
 
         <div
           className="flex h-8 min-w-0 items-center gap-1 px-2 text-[11px] text-[var(--text-tertiary)]"
@@ -1039,6 +1138,7 @@ function ComposerAutocomplete({
   rows,
   highlight,
   listRef,
+  loading,
   t,
   onAccept,
   onHighlight,
@@ -1046,6 +1146,7 @@ function ComposerAutocomplete({
   rows: ComposerAutocompleteRow[]
   highlight: number
   listRef: RefObject<VirtuosoHandle | null>
+  loading: boolean
   t: Translator
   onAccept: (index: number) => void
   onHighlight: (index: number) => void
@@ -1053,41 +1154,51 @@ function ComposerAutocomplete({
   return (
     <div
       aria-label={t('composer.suggestions')}
+      aria-live={loading ? 'polite' : undefined}
       className="waku-popover-surface absolute bottom-[calc(100%+6px)] left-0 z-[70] w-full overflow-hidden rounded-[11px] p-1"
       id="composer-autocomplete"
-      role="listbox"
-      style={{ height: Math.min(302, rows.length * 30 + 8) }}
+      role={loading ? 'status' : 'listbox'}
+      style={{ height: loading ? 38 : Math.min(302, rows.length * 30 + 8) }}
     >
-      <Virtuoso
-        className="size-full outline-none"
-        computeItemKey={(_, row) => row.kind === 'command'
-          ? `command:${row.command.scope}:${row.command.name}`
-          : `file:${row.file.path}`}
-        data={rows}
-        fixedItemHeight={30}
-        increaseViewportBy={90}
-        ref={listRef}
-        itemContent={(index, row) => (
-          <button
-            aria-selected={highlight === index}
-            className={cn(
-              'flex h-[30px] w-full items-center gap-2 rounded-md px-2 text-left outline-none',
-              highlight === index ? 'bg-accent' : 'hover:bg-accent/70',
-            )}
-            id={`composer-autocomplete-${index}`}
-            role="option"
-            tabIndex={-1}
-            type="button"
-            onMouseDown={(event) => {
-              event.preventDefault()
-              onAccept(index)
-            }}
-            onMouseEnter={() => onHighlight(index)}
-          >
-            <AutocompleteRowContents row={row} />
-          </button>
-        )}
-      />
+      {loading
+        ? (
+            <div className="flex h-[30px] items-center gap-2 px-2 text-[12px] text-[var(--text-tertiary)]">
+              <WakuIcon className="size-3 motion-safe:animate-spin" name="loaderCircle" />
+              {t('composer.loading_suggestions')}
+            </div>
+          )
+        : (
+            <Virtuoso
+              className="size-full outline-none"
+              computeItemKey={(_, row) => row.kind === 'command'
+                ? `command:${row.command.scope}:${row.command.name}`
+                : `file:${row.file.path}`}
+              data={rows}
+              fixedItemHeight={30}
+              increaseViewportBy={90}
+              ref={listRef}
+              itemContent={(index, row) => (
+                <button
+                  aria-selected={highlight === index}
+                  className={cn(
+                    'flex h-[30px] w-full items-center gap-2 rounded-md px-2 text-left outline-none',
+                    highlight === index ? 'bg-accent' : 'hover:bg-accent/70',
+                  )}
+                  id={`composer-autocomplete-${index}`}
+                  role="option"
+                  tabIndex={-1}
+                  type="button"
+                  onMouseDown={(event) => {
+                    event.preventDefault()
+                    onAccept(index)
+                  }}
+                  onMouseEnter={() => onHighlight(index)}
+                >
+                  <AutocompleteRowContents row={row} />
+                </button>
+              )}
+            />
+          )}
     </div>
   )
 }
@@ -1197,6 +1308,70 @@ function ComposerAttachmentTile({
         <WakuIcon className="size-[9px]" name="x" />
       </button>
     </div>
+  )
+}
+
+const GOAL_CHIP_KEYS: Record<ThreadGoalStatus, string> = {
+  active: 'goal.chip_active',
+  paused: 'goal.chip_paused',
+  blocked: 'goal.chip_stalled',
+  usageLimited: 'goal.chip_usage_limited',
+  budgetLimited: 'goal.chip_budget_limited',
+  complete: 'goal.chip_complete',
+}
+
+/** The thread-goal chip: present only while the provider reports a goal, it
+ * pairs a target icon with the status phrase and consumption — token budget
+ * when one bounds the goal, elapsed pursuit time otherwise (ticking live
+ * while the task works, like the Codex CLI) — and opens the goal dialog. */
+function GoalControl({
+  session,
+  busy,
+  onOpen,
+}: {
+  session: AgentSession
+  busy: boolean
+  onOpen: () => void
+}) {
+  const { t } = useI18n()
+  const goal = session.thread_goal ?? null
+  const observedAt = useRef(Date.now())
+  const accountingKey = goal
+    ? [goal.objective, goal.status, goal.timeUsedSeconds, goal.tokensUsed].join('\u0000')
+    : ''
+  useEffect(() => {
+    observedAt.current = Date.now()
+  }, [accountingKey])
+  const ticking = Boolean(goal && goal.status === 'active' && busy && goal.tokenBudget == null)
+  const [, setTick] = useState(0)
+  useEffect(() => {
+    if (!ticking) return
+    const timer = window.setInterval(() => setTick((value) => value + 1), 1_000)
+    return () => window.clearInterval(timer)
+  }, [ticking])
+  if (!goal) return null
+  const liveElapsed = goal.status === 'active' && busy
+    ? Math.floor((Date.now() - observedAt.current) / 1_000)
+    : 0
+  const phrase = t(GOAL_CHIP_KEYS[goal.status])
+  const usage = ['active', 'complete', 'budgetLimited'].includes(goal.status)
+    ? goalUsageReadout(goal, liveElapsed)
+    : null
+  return (
+    <button
+      className={cn(
+        'flex h-6 items-center gap-1.5 rounded-md px-1.5 outline-none hover:bg-accent focus-visible:ring-1 focus-visible:ring-ring',
+        goalStatusClass(goal.status),
+      )}
+      title={goal.objective}
+      type="button"
+      onClick={onOpen}
+    >
+      <WakuIcon className="size-[11px]" name="target" />
+      <span className="max-w-[220px] truncate">
+        {usage ? `${phrase} (${usage})` : phrase}
+      </span>
+    </button>
   )
 }
 
@@ -1384,7 +1559,8 @@ function InteractionModeControl({
   const { t } = useI18n()
   const plan = session.interaction_mode === 'plan'
   const minimal = session.provider === 'deepSeek' && session.agent_preset === 'minimal'
-  const interactive = plan || !minimal
+  const supportsPlan = session.provider !== 'fx' && !minimal
+  const interactive = plan || supportsPlan
   return (
     <button
       aria-label={t('mode.switch_to', { mode: t(plan ? 'mode.build' : 'mode.plan') })}
@@ -1394,7 +1570,11 @@ function InteractionModeControl({
         interactive ? 'hover:bg-accent' : 'opacity-50',
       )}
       disabled={!interactive}
-      title={minimal && !plan ? t('agent_preset.minimal_no_plan') : undefined}
+      title={
+        !interactive
+          ? t(session.provider === 'fx' ? 'mode.plan_not_supported' : 'agent_preset.minimal_no_plan')
+          : undefined
+      }
       type="button"
       onClick={() => onPatch({ interaction_mode: plan ? 'build' : 'plan' })}
     >

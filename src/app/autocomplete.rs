@@ -31,7 +31,8 @@ use super::composer::next_picker_highlight;
 use super::*;
 
 /// Key context the composer card declares while the popup is open.
-const AUTOCOMPLETE_CONTEXT: &str = "ComposerAutocomplete > ComposerInput";
+const AUTOCOMPLETE_CONTEXT: &str = "ComposerAutocomplete > TextInput";
+const AUTOCOMPLETE_LOADING_CONTEXT: &str = "ComposerAutocompleteLoading > TextInput";
 
 /// Bind the popup's keys. Must run after [`crate::input::init`]: `enter` and
 /// the arrows tie with the field's own bindings at the `ComposerInput` depth,
@@ -43,6 +44,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("enter", ConfirmEntry, Some(AUTOCOMPLETE_CONTEXT)),
         KeyBinding::new("tab", ConfirmEntry, Some(AUTOCOMPLETE_CONTEXT)),
         KeyBinding::new("escape", DismissMenu, Some(AUTOCOMPLETE_CONTEXT)),
+        KeyBinding::new("escape", DismissMenu, Some(AUTOCOMPLETE_LOADING_CONTEXT)),
     ]);
 }
 
@@ -112,8 +114,10 @@ impl Waku {
         else {
             self.slash_command_index = Rc::new(Vec::new());
             self.slash_command_index_key = None;
+            self.slash_command_index_loading = false;
             self.mention_file_index = Rc::new(Vec::new());
             self.mention_file_index_path = None;
+            self.mention_file_index_loading = false;
             return;
         };
         let provider = self
@@ -124,16 +128,19 @@ impl Waku {
             .selected_session()
             .map(|session| session.available_commands.clone())
             .unwrap_or_default();
+        let binary_override = self.state.provider_binary_overrides.get(&provider).cloned();
 
-        let command_key = (provider, project_path.clone());
+        let command_key = (provider, project_path.clone(), binary_override.clone());
         match self.slash_commands.read(&command_key) {
             Query::Ready(commands) => {
                 self.slash_command_index = Rc::new(composer_complete::merge_reported_commands(
                     &commands, &reported,
                 ));
                 self.slash_command_index_key = Some(command_key);
+                self.slash_command_index_loading = false;
             }
             Query::Pending => {
+                self.slash_command_index_loading = true;
                 // A scan for this exact key is in flight; anything drawn
                 // meanwhile must not be another provider's list.
                 if self.slash_command_index_key.as_ref() != Some(&command_key) {
@@ -142,6 +149,7 @@ impl Waku {
                 }
             }
             Query::Missing(token) => {
+                self.slash_command_index_loading = true;
                 if self.slash_command_index_key.as_ref() != Some(&command_key) {
                     self.slash_command_index = Rc::new(Vec::new());
                     self.slash_command_index_key = None;
@@ -156,6 +164,7 @@ impl Waku {
                                 waku_client::WorkspaceOperation::DiscoverSlashCommands {
                                     provider,
                                     project_root: path,
+                                    binary_override,
                                 },
                             ) {
                                 Ok(waku_client::WorkspaceResult::SlashCommands { commands }) => {
@@ -181,14 +190,17 @@ impl Waku {
             Query::Ready(files) => {
                 self.mention_file_index = files.as_ref().clone().into();
                 self.mention_file_index_path = Some(project_path);
+                self.mention_file_index_loading = false;
             }
             Query::Pending => {
+                self.mention_file_index_loading = true;
                 if self.mention_file_index_path.as_ref() != Some(&project_path) {
                     self.mention_file_index = Rc::new(Vec::new());
                     self.mention_file_index_path = None;
                 }
             }
             Query::Missing(token) => {
+                self.mention_file_index_loading = true;
                 if self.mention_file_index_path.as_ref() != Some(&project_path) {
                     self.mention_file_index = Rc::new(Vec::new());
                     self.mention_file_index_path = None;
@@ -235,7 +247,9 @@ impl Waku {
                 .selected_session()
                 .map(|session| session.provider)
                 .unwrap_or(self.state.last_provider);
-            self.slash_commands.invalidate(&(provider, path.clone()));
+            let binary_override = self.state.provider_binary_overrides.get(&provider).cloned();
+            self.slash_commands
+                .invalidate(&(provider, path.clone(), binary_override));
             self.mention_files.invalidate(&path);
         }
         self.refresh_composer_sources(cx);
@@ -247,7 +261,7 @@ impl Waku {
     fn composer_trigger(&self, window: &Window, cx: &App) -> Option<Trigger> {
         let input = self.composer.read(cx);
         let trigger = if input.focus().is_focused(window) {
-            composer_complete::detect_trigger(input.content(), input.cursor())
+            composer_complete::detect_trigger(input.content(cx), input.cursor(cx))
         } else {
             None
         };
@@ -353,11 +367,14 @@ impl Waku {
             return;
         };
         let insert = match row {
-            AutocompleteRow::Command(scored) => format!("/{} ", scored.item.name),
+            AutocompleteRow::Command(scored) => {
+                let composer_text = composer_complete::command_composer_text(&scored.item);
+                format!("{composer_text} ")
+            }
             AutocompleteRow::File(scored) => format!("@{} ", scored.item.path),
         };
         if matches!(row, AutocompleteRow::Command(_)) {
-            let mut submission = self.composer.read(cx).content().to_owned();
+            let mut submission = self.composer.read(cx).content(cx).to_owned();
             submission.replace_range(trigger.range.clone(), &insert);
             if self.execute_local_composer_command(&submission, cx) {
                 return;
@@ -381,10 +398,14 @@ impl Waku {
         &self,
         window: &Window,
         cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
+    ) -> Option<(AnyElement, bool)> {
         let trigger = self.composer_trigger(window, cx)?;
         let rows = self.autocomplete_rows(&trigger);
-        if rows.is_empty() {
+        let loading = match trigger.kind {
+            TriggerKind::Command => self.slash_command_index_loading,
+            TriggerKind::File => self.mention_file_index_loading,
+        };
+        if rows.is_empty() && !loading {
             return None;
         }
         // The probe records during paint, so the first frame a composer ever
@@ -404,12 +425,31 @@ impl Waku {
             .overflow_y_scroll()
             .track_scroll(&self.composer_autocomplete.scroll)
             .p(px(4.0));
-        for (index, row) in rows.iter().enumerate() {
-            list =
-                list.child(self.render_autocomplete_row(index, row, highlight, &theme, window, cx));
+        if rows.is_empty() {
+            list = list.child(
+                div()
+                    .h(px(30.0))
+                    .px(px(8.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .text_size(sp(12.5))
+                    .text_color(theme.text_tertiary)
+                    .child(crate::ui::motion::spin(icon(
+                        "icons/loader-circle.svg",
+                        12.0,
+                        theme.text_tertiary,
+                    )))
+                    .child(tr!("composer.loading_suggestions")),
+            );
+        } else {
+            for (index, row) in rows.iter().enumerate() {
+                list = list
+                    .child(self.render_autocomplete_row(index, row, highlight, &theme, window, cx));
+            }
         }
 
-        Some(
+        Some((
             deferred(
                 anchored()
                     .position(point(card_bounds.origin.x, card_bounds.origin.y - px(6.0)))
@@ -436,7 +476,8 @@ impl Waku {
             )
             .with_priority(1)
             .into_any_element(),
-        )
+            !rows.is_empty(),
+        ))
     }
 
     fn render_autocomplete_row(
@@ -470,12 +511,13 @@ impl Waku {
         match row {
             AutocompleteRow::Command(scored) => {
                 let command = &scored.item;
+                let composer_text = composer_complete::command_composer_text(command);
                 let icon_path = if command.scope == composer_complete::CommandScope::Skill {
                     "icons/sparkle.svg"
                 } else {
                     "icons/command.svg"
                 };
-                // Positions index the bare name; the drawn `/` shifts every
+                // Positions index the bare name; the drawn sigil shifts every
                 // byte range right by one.
                 let name_ranges = highlight_byte_ranges(&command.name, &scored.positions, 0)
                     .into_iter()
@@ -489,9 +531,9 @@ impl Waku {
                             .flex_none()
                             .max_w(px(260.0))
                             .truncate()
-                            .text_size(px(12.0))
+                            .text_size(sp(12.5))
                             .child(matched_text(
-                                format!("/{}", command.name),
+                                composer_text,
                                 name_ranges,
                                 theme.text,
                                 theme.accent,
@@ -502,7 +544,7 @@ impl Waku {
                         element.child(
                             div()
                                 .flex_none()
-                                .text_size(px(11.0))
+                                .text_size(sp(12.5))
                                 .text_color(theme.text_ghost)
                                 .child(hint),
                         )
@@ -512,13 +554,13 @@ impl Waku {
                             .flex_1()
                             .min_w_0()
                             .truncate()
-                            .text_size(px(11.0))
+                            .text_size(sp(12.5))
                             .text_color(theme.text_tertiary)
                             .child(SharedString::from(command.description.clone())),
                     )
                     .child(
                         div()
-                            .h(px(16.0))
+                            .h(px(18.0))
                             .px(px(5.0))
                             .flex_none()
                             .rounded(px(4.0))
@@ -526,7 +568,7 @@ impl Waku {
                             .border_color(theme.border)
                             .flex()
                             .items_center()
-                            .text_size(px(9.0))
+                            .text_size(sp(12.5))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(theme.text_tertiary)
                             .child(command.scope.label()),
@@ -557,7 +599,7 @@ impl Waku {
                             .flex_none()
                             .max_w(px(300.0))
                             .truncate()
-                            .text_size(px(12.0))
+                            .text_size(sp(12.5))
                             .child(matched_text(
                                 name.to_owned(),
                                 highlight_byte_ranges(name, &scored.positions, name_char_offset),
@@ -572,7 +614,7 @@ impl Waku {
                                 .flex_1()
                                 .min_w_0()
                                 .truncate()
-                                .text_size(px(11.0))
+                                .text_size(sp(12.5))
                                 .child(matched_text(
                                     parent.to_owned(),
                                     highlight_byte_ranges(parent, &scored.positions, 0),

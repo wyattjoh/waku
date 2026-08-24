@@ -7,6 +7,12 @@ fn retain_runtime_after_cancel(provider: ProviderKind) -> bool {
     !matches!(provider, ProviderKind::Codex | ProviderKind::Amp)
 }
 
+fn new_task_runtime_mode(current: Option<&AgentSession>, remembered: RuntimeMode) -> RuntimeMode {
+    current
+        .map(|session| session.runtime_mode)
+        .unwrap_or(remembered)
+}
+
 impl Waku {
     pub(crate) fn open_task_from_notification(&mut self, session_id: Uuid, cx: &mut Context<Self>) {
         self.select_session(session_id, cx);
@@ -166,20 +172,29 @@ impl Waku {
             self.store_selected_right_panel_state();
         }
         self.state.selected_session = Some(session_id);
-        if let Some((project_id, provider, model, reasoning_effort, service_tier, context_window)) =
-            self.selected_session().map(|session| {
-                (
-                    session.project_id,
-                    session.provider,
-                    session.model.clone(),
-                    session.reasoning_effort.clone(),
-                    session.service_tier.clone(),
-                    session.context_window.clone(),
-                )
-            })
-        {
+        self.task_switcher.record_access(session_id);
+        if let Some((
+            project_id,
+            provider,
+            runtime_mode,
+            model,
+            reasoning_effort,
+            service_tier,
+            context_window,
+        )) = self.selected_session().map(|session| {
+            (
+                session.project_id,
+                session.provider,
+                session.runtime_mode,
+                session.model.clone(),
+                session.reasoning_effort.clone(),
+                session.service_tier.clone(),
+                session.context_window.clone(),
+            )
+        }) {
             self.state.selected_project = Some(project_id);
             self.state.last_provider = provider;
+            self.state.last_runtime_mode = runtime_mode;
             self.state.last_model = model;
             self.state.last_reasoning_effort = reasoning_effort;
             self.state.last_service_tier = service_tier;
@@ -231,6 +246,9 @@ impl Waku {
             return;
         };
         self.branch_snapshots.invalidate(&workspace_path);
+        self.sidebar_branch_scan_fingerprint.set(None);
+        self.sidebar_branch_scan_generation
+            .set(self.sidebar_branch_scan_generation.get().wrapping_add(1));
         self.refresh_workspace_surfaces(cx);
         self.invalidate_composer_sources(cx);
     }
@@ -251,7 +269,13 @@ impl Waku {
             self.select_session(draft_id, cx);
             return;
         }
-        let session = self.state.new_session(project_id, provider);
+        // A task opened from the current task carries its working access mode.
+        // `last_runtime_mode` covers launch and the few creation paths without
+        // a selected source task.
+        let runtime_mode =
+            new_task_runtime_mode(self.selected_session(), self.state.last_runtime_mode);
+        let mut session = self.state.new_session(project_id, provider);
+        session.runtime_mode = runtime_mode;
         let id = session.id;
         self.state.push_session(session);
         self.select_session(id, cx);
@@ -297,6 +321,9 @@ impl Waku {
             .map(std::path::Path::to_path_buf);
         let was_selected = self.state.selected_session == Some(session_id);
         self.submission_preparations.remove(&session_id);
+        self.goal_runtime_starts.remove(&session_id);
+        self.pending_goal_operations.remove(&session_id);
+        self.goal_observed_at.remove(&session_id);
         self.reset_session_runtime(session_id);
         self.background_work.remove(&session_id);
         self.remove_right_panel_session_state(session_id);
@@ -312,6 +339,7 @@ impl Waku {
             self.pending_session_activation = None;
         }
         self.session_navigation.remove(session_id);
+        self.task_switcher.remove(session_id);
         let project_still_used = self
             .state
             .sessions
@@ -379,17 +407,22 @@ impl Waku {
         cx: &mut Context<Self>,
     ) {
         self.settings_page = None;
-        if let Some(session_id) = self
-            .session_navigation
-            .remembered_new_task(&self.state.sessions)
-        {
-            self.select_session(session_id, cx);
-        } else if self.selected_project().is_some_and(Project::is_projectless) {
-            self.create_projectless_session(cx);
-        } else if let Some(project_id) = self.state.selected_project {
-            self.create_session_for(project_id, self.state.last_provider, cx);
-        } else {
-            self.create_projectless_session(cx);
+        let current_project = self
+            .selected_project()
+            .map(|project| (project.id, project.is_projectless()));
+        match current_project {
+            Some((_, true)) => self.create_projectless_session(cx),
+            Some((project_id, false)) => {
+                if let Some(session_id) = self
+                    .session_navigation
+                    .remembered_new_task(&self.state.sessions, project_id)
+                {
+                    self.select_session(session_id, cx);
+                } else {
+                    self.create_session_for(project_id, self.state.last_provider, cx);
+                }
+            }
+            None => self.create_projectless_session(cx),
         }
         let focus_handle = self.composer_focus(cx);
         window.focus(&focus_handle, cx);
@@ -458,8 +491,17 @@ impl Waku {
             return;
         }
         self.sidebar_visible = visible;
+        self.sidebar_slide = self.begin_panel_slide(self.sidebar_rendered_width, cx);
         self.persist_panel_layout();
         cx.notify();
+    }
+
+    /// A toggle's slide, starting from the width the panel currently occupies
+    /// so an interrupted one reverses from where its edge actually is.
+    /// Reduce-motion gets `None`: the panel simply appears at its new width,
+    /// and no frames are scheduled for it.
+    fn begin_panel_slide(&self, from: f32, cx: &App) -> Option<motion::WidthTween> {
+        (!cx.reduce_motion()).then(|| motion::WidthTween::new(from))
     }
 
     pub(super) fn set_right_panel_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
@@ -472,6 +514,7 @@ impl Waku {
             return;
         }
         self.right_panel_visible = visible;
+        self.right_panel_slide = self.begin_panel_slide(self.right_panel_rendered_width, cx);
         if visible {
             self.analytics
                 .track(crate::analytics::Event::RightPanelOpened);
@@ -516,11 +559,16 @@ impl Waku {
         });
     }
 
+    /// The width each panel lays its content out at. A panel mid-slide counts
+    /// as on screen and keeps its full width here: the slide narrows the
+    /// container that clips it, so nothing inside reflows on the way out.
+    /// What the panel actually occupies this frame is
+    /// [`Waku::sidebar_rendered_width`] / [`Waku::right_panel_rendered_width`].
     pub(super) fn effective_panel_widths(&self, window: &Window) -> (f32, f32) {
         fitted_panel_widths(
             f32::from(window.viewport_size().width),
-            self.sidebar_visible,
-            self.right_panel_visible,
+            self.sidebar_visible || self.sidebar_slide.is_some(),
+            self.right_panel_visible || self.right_panel_slide.is_some(),
             self.sidebar_width,
             self.right_panel_width,
         )
@@ -534,13 +582,17 @@ impl Waku {
         cx: &mut Context<Self>,
     ) {
         let (sidebar_width, right_panel_width) = self.effective_panel_widths(window);
+        // A drag tracks the pointer directly; whatever slide was still
+        // finishing would fight it for the same edge.
         let start_width = match target {
             PanelResizeTarget::Sidebar => {
+                self.sidebar_slide = None;
                 self.sidebar_width = sidebar_width;
                 crate::platform::set_sidebar_material_width(window, sidebar_width);
                 sidebar_width
             }
             PanelResizeTarget::RightPanel => {
+                self.right_panel_slide = None;
                 self.right_panel_width = right_panel_width;
                 right_panel_width
             }
@@ -710,6 +762,13 @@ impl Waku {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // The switcher focus lands after its deferred overlay is painted.
+        // Route the root Escape action here too so an immediate press always
+        // cancels the provisional selection instead of reaching the session.
+        if self.task_switcher.is_open() {
+            self.cancel_task_switcher(window, cx);
+            return;
+        }
         if self.settings_page.take().is_some() {
             let focus_handle = self.composer_focus(cx);
             window.focus(&focus_handle, cx);
@@ -758,6 +817,7 @@ impl Waku {
         // Selection belongs to the session being left.
         self.transcript_selection.selection.borrow_mut().clear();
         self.transcript_selection.registry.borrow_mut().clear();
+        self.reset_transcript_search_for_session();
         let (streaming_messages, live_reasoning) = self.selected_session().map_or_else(
             || (Vec::new(), Vec::new()),
             |session| {
@@ -980,12 +1040,21 @@ impl Waku {
         if mode == RuntimeMode::Plan {
             return;
         }
-        if let Some(session) = self.selected_session_mut()
-            && session.runtime_mode != mode
-        {
-            let session_id = session.id;
-            session.runtime_mode = mode;
+        let Some((session_id, session_changed)) = self
+            .selected_session()
+            .map(|session| (session.id, session.runtime_mode != mode))
+        else {
+            return;
+        };
+        let remembered_changed = self.state.last_runtime_mode != mode;
+        if session_changed {
+            self.selected_session_mut()
+                .expect("selected session still exists")
+                .runtime_mode = mode;
             self.apply_session_options(session_id, cx);
+        }
+        if session_changed || remembered_changed {
+            self.state.last_runtime_mode = mode;
             self.save();
             cx.notify();
         }
@@ -1096,6 +1165,10 @@ impl Waku {
             .find(|session| session.id == session_id)
             .is_some_and(|session| retain_runtime_after_cancel(session.provider))
             || self.session_has_live_detached_work(session_id);
+        // Goal operations queued behind a starting runtime would set the
+        // objective after this stop and begin pursuing it; the user asked to
+        // stop, so they leave with the turn.
+        self.pending_goal_operations.remove(&session_id);
         let mut runtime = self.runtimes.remove(&session_id);
         if let Some(runtime) = runtime.as_ref() {
             runtime.driver.cancel();
@@ -1587,10 +1660,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn new_task_navigation_keeps_the_selected_project_after_visiting_history() {
+    fn new_task_carries_the_current_tasks_access_mode() {
+        let mut current = AgentSession::new(Uuid::new_v4(), ProviderKind::OpenCode);
+        current.runtime_mode = RuntimeMode::Ask;
+
+        assert_eq!(
+            new_task_runtime_mode(Some(&current), RuntimeMode::FullAccess),
+            RuntimeMode::Ask
+        );
+        assert_eq!(
+            new_task_runtime_mode(None, RuntimeMode::AutoAcceptEdits),
+            RuntimeMode::AutoAcceptEdits
+        );
+    }
+
+    #[test]
+    fn new_task_navigation_reuses_a_draft_from_the_current_project() {
         let project_id = Uuid::new_v4();
         let draft = AgentSession::new(project_id, ProviderKind::Codex);
-        let mut started = AgentSession::new(Uuid::new_v4(), ProviderKind::Claude);
+        let mut started = AgentSession::new(project_id, ProviderKind::Claude);
         started.begin_turn("Existing task");
         let mut navigation = SessionNavigation::default();
 
@@ -1598,8 +1686,22 @@ mod tests {
         navigation.visit(Some(draft.id), started.id);
 
         assert_eq!(
-            navigation.remembered_new_task(&[draft.clone(), started]),
+            navigation.remembered_new_task(&[draft.clone(), started], project_id),
             Some(draft.id)
+        );
+    }
+
+    #[test]
+    fn new_task_navigation_does_not_reopen_a_draft_from_another_project() {
+        let draft = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
+        let current_project_id = Uuid::new_v4();
+        let mut navigation = SessionNavigation::default();
+
+        navigation.remember_new_task(draft.id);
+
+        assert_eq!(
+            navigation.remembered_new_task(&[draft], current_project_id),
+            None
         );
     }
 
@@ -1611,7 +1713,10 @@ mod tests {
         navigation.remember_new_task(draft.id);
 
         draft.begin_turn("Start it");
-        assert_eq!(navigation.remembered_new_task(&[draft.clone()]), None);
+        assert_eq!(
+            navigation.remembered_new_task(&[draft.clone()], project_id),
+            None
+        );
 
         navigation.remove(draft.id);
         assert_eq!(navigation.new_task, None);

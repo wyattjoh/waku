@@ -53,7 +53,7 @@ impl Waku {
                     .flex()
                     .items_center()
                     .cursor_default()
-                    .text_size(px(11.5))
+                    .text_size(sp(12.5))
                     .font_weight(FontWeight::SEMIBOLD)
                     .when(allow, |element| {
                         element
@@ -95,7 +95,7 @@ impl Waku {
                             .child(icon("icons/alert.svg", 13.0, theme.warning))
                             .child(
                                 div()
-                                    .text_size(px(12.5))
+                                    .text_size(sp(12.5))
                                     .font_weight(FontWeight::MEDIUM)
                                     .text_color(theme.text)
                                     .child(SharedString::from(permission.title.clone())),
@@ -111,8 +111,8 @@ impl Waku {
                             .rounded(px(7.0))
                             .bg(theme.inset)
                             .font_family(crate::md::render::MONO_FAMILY)
-                            .text_size(px(10.5))
-                            .line_height(px(16.0))
+                            .text_size(sp(12.5))
+                            .line_height(sp(16.0))
                             .text_color(theme.text_secondary)
                             .whitespace_normal()
                             .child(SharedString::from(permission.detail.clone())),
@@ -187,7 +187,7 @@ impl Waku {
                             .min_w_0()
                             .child(
                                 div()
-                                    .text_size(px(11.5))
+                                    .text_size(sp(12.5))
                                     .font_weight(FontWeight::MEDIUM)
                                     .text_color(theme.text)
                                     .child(SharedString::from(option.label.clone())),
@@ -195,8 +195,8 @@ impl Waku {
                             .children(option.description.as_ref().map(|description| {
                                 div()
                                     .mt(px(1.0))
-                                    .text_size(px(10.0))
-                                    .line_height(px(13.0))
+                                    .text_size(sp(12.5))
+                                    .line_height(sp(15.0))
                                     .text_color(theme.text_secondary)
                                     .whitespace_normal()
                                     .child(SharedString::from(description.clone()))
@@ -239,7 +239,7 @@ impl Waku {
                 .flex()
                 .items_center()
                 .cursor_default()
-                .text_size(px(10.5))
+                .text_size(sp(12.5))
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(theme.text_tertiary)
                 .focus_visible(|style| style.border_1().border_color(theme.accent))
@@ -267,7 +267,7 @@ impl Waku {
             .flex()
             .items_center()
             .cursor_default()
-            .text_size(px(10.5))
+            .text_size(sp(12.5))
             .font_weight(FontWeight::SEMIBOLD)
             .bg(if can_continue {
                 theme.inverse
@@ -306,7 +306,7 @@ impl Waku {
                 .bg(theme.overlay)
                 .flex()
                 .items_center()
-                .text_size(px(9.5))
+                .text_size(sp(12.5))
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(theme.text_tertiary)
                 .child(tr!(
@@ -339,7 +339,7 @@ impl Waku {
                         .gap(px(8.0))
                         .child(
                             div()
-                                .text_size(px(10.5))
+                                .text_size(sp(12.5))
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(theme.text_tertiary)
                                 .child(SharedString::from(question.header.clone())),
@@ -349,8 +349,8 @@ impl Waku {
                 .child(
                     div()
                         .mt(px(5.0))
-                        .text_size(px(13.0))
-                        .line_height(px(18.0))
+                        .text_size(sp(13.0))
+                        .line_height(sp(18.0))
                         .font_weight(FontWeight::MEDIUM)
                         .text_color(theme.text)
                         .whitespace_normal()
@@ -381,8 +381,8 @@ impl Waku {
                         .flex()
                         .items_center()
                         .gap(px(7.0))
-                        .text_size(px(11.5))
-                        .line_height(px(16.0))
+                        .text_size(sp(12.5))
+                        .line_height(sp(16.0))
                         .child(icon(
                             "icons/pencil.svg",
                             11.0,
@@ -434,7 +434,7 @@ impl Waku {
                     .flex()
                     .items_center()
                     .cursor_default()
-                    .text_size(px(11.5))
+                    .text_size(sp(12.5))
                     .font_weight(FontWeight::SEMIBOLD)
                     .when(primary, |element| {
                         element
@@ -476,7 +476,7 @@ impl Waku {
                         .child(icon("icons/globe.svg", 14.0, theme.warning))
                         .child(
                             div()
-                                .text_size(px(12.5))
+                                .text_size(sp(12.5))
                                 .font_weight(FontWeight::MEDIUM)
                                 .text_color(theme.text)
                                 .child(tr!("computer_use.allow_control", app = &target.app_name)),
@@ -485,8 +485,8 @@ impl Waku {
                 .child(
                     div()
                         .mt(px(7.0))
-                        .text_size(px(10.0))
-                        .line_height(px(14.0))
+                        .text_size(sp(12.5))
+                        .line_height(sp(14.0))
                         .text_color(theme.text_secondary)
                         .child(tr!("computer_use.screenshot_shared")),
                 )
@@ -498,7 +498,7 @@ impl Waku {
                         .bg(theme.inset)
                         .child(
                             div()
-                                .text_size(px(11.5))
+                                .text_size(sp(12.5))
                                 .font_weight(FontWeight::MEDIUM)
                                 .text_color(theme.text)
                                 .truncate()
@@ -507,7 +507,7 @@ impl Waku {
                         .child(
                             div()
                                 .mt(px(4.0))
-                                .text_size(px(10.5))
+                                .text_size(sp(12.5))
                                 .text_color(theme.text_secondary)
                                 .child(SharedString::from(permission.request.summary())),
                         )
@@ -515,7 +515,7 @@ impl Waku {
                             element.child(
                                 div()
                                     .mt(px(5.0))
-                                    .text_size(px(10.5))
+                                    .text_size(sp(12.5))
                                     .text_color(theme.warning)
                                     .child(tr!("computer_use.sensitive_action")),
                             )
@@ -524,7 +524,7 @@ impl Waku {
                 .child(
                     div()
                         .mt(px(7.0))
-                        .text_size(px(10.0))
+                        .text_size(sp(12.5))
                         .text_color(theme.text_tertiary)
                         .child(if target.persistable() {
                             tr!("computer_use.bundle_id", id = &target.bundle_id)
@@ -622,7 +622,7 @@ impl Waku {
                                         .items_center()
                                         .justify_center()
                                         .bg(theme.overlay_strong)
-                                        .text_size(px(11.0))
+                                        .text_size(sp(12.5))
                                         .font_weight(FontWeight::SEMIBOLD)
                                         .text_color(theme.text_secondary)
                                         .child(SharedString::from(app_initial)),
@@ -633,7 +633,7 @@ impl Waku {
                                         .min_w_0()
                                         .child(
                                             div()
-                                                .text_size(px(11.5))
+                                                .text_size(sp(12.5))
                                                 .font_weight(FontWeight::MEDIUM)
                                                 .text_color(theme.text)
                                                 .truncate()
@@ -642,7 +642,7 @@ impl Waku {
                                         .child(
                                             div()
                                                 .mt(px(1.0))
-                                                .text_size(px(9.5))
+                                                .text_size(sp(12.5))
                                                 .text_color(theme.text_tertiary)
                                                 .truncate()
                                                 .child(SharedString::from(title)),
@@ -662,7 +662,7 @@ impl Waku {
                                             .flex()
                                             .items_center()
                                             .cursor_default()
-                                            .text_size(px(10.0))
+                                            .text_size(sp(12.5))
                                             .font_weight(FontWeight::MEDIUM)
                                             .text_color(if active {
                                                 theme.danger
@@ -732,7 +732,7 @@ impl Waku {
                                             )
                                             .child(
                                                 div()
-                                                    .text_size(px(10.0))
+                                                    .text_size(sp(12.5))
                                                     .text_color(theme.text_tertiary)
                                                     .child(tr!("computer_use.preparing_preview")),
                                             ),
@@ -761,7 +761,7 @@ impl Waku {
                                         )
                                         .child(
                                             div()
-                                                .text_size(px(9.5))
+                                                .text_size(sp(12.5))
                                                 .font_weight(FontWeight::MEDIUM)
                                                 .text_color(theme.text)
                                                 .child(status),
@@ -833,14 +833,21 @@ impl Waku {
         let weak = cx.entity().downgrade();
         let search = self.model_search.clone();
         let search_focus = search.read(cx).focus_handle(cx);
+        let empty_focus = self.model_picker_empty_focus.clone();
+        let no_providers = self.model_picker_has_no_providers();
 
         let handle = {
             let reset_weak = weak.clone();
             let reset_search = search.clone();
             let picker_focus = search_focus.clone();
+            let empty_picker_focus = empty_focus.clone();
             self.menu_handle_with(MODEL_PICKER_MENU_ID, cx, move |open, window, cx| {
+                // The empty state draws no filter field, so the handle the
+                // deferred focus below targets depends on which body opened.
+                let mut empty = false;
                 let _ = reset_weak.update(cx, |this, cx| {
                     if open {
+                        empty = this.model_picker_has_no_providers();
                         let provider = this
                             .selected_session()
                             .map(|session| session.provider)
@@ -883,7 +890,11 @@ impl Waku {
                     // on the container's first-ever paint it reads a zeroed
                     // viewport, lands wrong, and is consumed. By this frame
                     // the panel has painted real bounds to resolve against.
-                    let picker_focus = picker_focus.clone();
+                    let picker_focus = if empty {
+                        empty_picker_focus.clone()
+                    } else {
+                        picker_focus.clone()
+                    };
                     let reveal_weak = reset_weak.clone();
                     window.on_next_frame(move |window, _| {
                         window.on_next_frame(move |window, cx| {
@@ -920,20 +931,34 @@ impl Waku {
         let scroll = self.model_picker_scroll.clone();
         let scrollbar_state = self.model_picker_scrollbar.clone();
 
-        popover(
+        // With nothing to pick from, naming a model the app cannot run would
+        // be a lie. The chip says so instead, and stays a trigger because the
+        // panel behind it is where the fix lives. Icon plus wording carry the
+        // state on their own, so the warning tint is never the only signal.
+        let trigger = if no_providers {
+            MenuChip::new("composer-provider-model")
+                .icon("icons/alert.svg", theme.warning)
+                .label(tr!("models.no_providers"))
+        } else {
             MenuChip::new("composer-provider-model")
                 .icon(
                     provider_icon(provider),
                     provider_color(&theme, provider).opacity(0.9),
                 )
                 .label(selected_model_name)
-                .caret(false)
-                .selected(handle.is_open()),
+        };
+
+        popover(
+            trigger.caret(false).selected(handle.is_open()),
             &handle,
             MenuAlign::AboveLeft,
             move |popover, _window, _cx| {
                 let popover = popover.clone();
                 let available_models = available_models.clone();
+
+                if no_providers {
+                    return model_picker_empty_state(&theme, &empty_focus, popover, weak.clone());
+                }
 
                 let mut sidebar = div()
                     .w(px(50.0))
@@ -988,6 +1013,21 @@ impl Waku {
                 // agree on which tabs are usable.
                 let rail_tabs = visible_picker_tabs(&probes, &disabled_providers, locked_provider);
                 for kind in ProviderKind::ALL {
+                    // A provider with no CLI on the machine, or one switched
+                    // off in the Providers settings, leaves the rail entirely
+                    // rather than sitting there dimmed: a tab that can never
+                    // open only advertises a choice settings already ruled
+                    // out. Being locked out by the current session is a
+                    // different claim — that tab stays, dimmed, because it is
+                    // true only until the next session.
+                    if !picker_rail_shows_provider(
+                        &probes,
+                        &disabled_providers,
+                        locked_provider,
+                        kind,
+                    ) {
+                        continue;
+                    }
                     let usable = rail_tabs.contains(&ModelPickerTab::Provider(kind));
                     let selected = selected_tab == ModelPickerTab::Provider(kind) && !searching;
                     let tab_weak = weak.clone();
@@ -1075,7 +1115,7 @@ impl Waku {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .text_size(px(11.5))
+                            .text_size(sp(12.5))
                             .text_color(theme.text_ghost)
                             .child(label),
                     );
@@ -1129,7 +1169,7 @@ impl Waku {
                                     .child(
                                         div()
                                             .truncate()
-                                            .text_size(px(13.0))
+                                            .text_size(sp(13.0))
                                             .font_weight(FontWeight::SEMIBOLD)
                                             .text_color(theme.text)
                                             .child(SharedString::from(model.name.clone())),
@@ -1148,7 +1188,7 @@ impl Waku {
                                             .child(
                                                 div()
                                                     .truncate()
-                                                    .text_size(px(11.0))
+                                                    .text_size(sp(12.5))
                                                     .text_color(theme.text_tertiary)
                                                     .child(SharedString::from(subtitle)),
                                             ),
@@ -1222,7 +1262,7 @@ impl Waku {
                     .flex()
                     // The filter field keeps focus and the selected row is only
                     // drawn, never focused — the same split Zed's picker uses.
-                    // These arrive as actions bound to `WakuMenu > ComposerInput`,
+                    // These arrive as actions bound to `WakuMenu > TextInput`,
                     // which is the only way to claim a key out from under a
                     // focused text field.
                     .on_action(move |_: &SelectNextEntry, _, cx| {
@@ -1454,8 +1494,10 @@ impl Waku {
             });
 
         let fast = selected_tier == "fast" || tier_label.eq_ignore_ascii_case("fast");
-        let trigger_label = match (effort_label.unwrap_or_else(|| tier_label.clone()), window_label)
-        {
+        let trigger_label = match (
+            effort_label.unwrap_or_else(|| tier_label.clone()),
+            window_label,
+        ) {
             (label, Some(window)) => format!("{label} · {window}"),
             (label, None) => label,
         };
@@ -1602,7 +1644,7 @@ impl Waku {
                                             div()
                                                 .w_full()
                                                 .truncate()
-                                                .text_size(px(12.0))
+                                                .text_size(sp(12.5))
                                                 .font_weight(if selected {
                                                     FontWeight::SEMIBOLD
                                                 } else {
@@ -1615,8 +1657,8 @@ impl Waku {
                                             div()
                                                 .w_full()
                                                 .mt(px(2.0))
-                                                .text_size(px(10.5))
-                                                .line_height(px(14.0))
+                                                .text_size(sp(12.5))
+                                                .line_height(sp(14.0))
                                                 .whitespace_normal()
                                                 .text_color(theme.text_tertiary)
                                                 .child(option.description()),
@@ -1715,7 +1757,7 @@ impl Waku {
                                             div()
                                                 .w_full()
                                                 .truncate()
-                                                .text_size(px(12.0))
+                                                .text_size(sp(12.5))
                                                 .font_weight(if selected {
                                                     FontWeight::SEMIBOLD
                                                 } else {
@@ -1728,8 +1770,8 @@ impl Waku {
                                             div()
                                                 .w_full()
                                                 .mt(px(2.0))
-                                                .text_size(px(10.5))
-                                                .line_height(px(14.0))
+                                                .text_size(sp(12.5))
+                                                .line_height(sp(14.0))
                                                 .whitespace_normal()
                                                 .overflow_hidden()
                                                 .text_color(theme.text_tertiary)
@@ -1762,13 +1804,21 @@ impl Waku {
             .selected_session()
             .map(|session| session.interaction_mode)
             .unwrap_or_default();
-        let supports_plan = self.selected_session().is_none_or(|session| {
-            session.provider != ProviderKind::DeepSeek
-                || self.agent_preset_for_session(session).as_deref() != Some("minimal")
+        let selected_session = self.selected_session();
+        let supports_plan = selected_session.is_none_or(|session| {
+            session.provider != ProviderKind::Fx
+                && (session.provider != ProviderKind::DeepSeek
+                    || self.agent_preset_for_session(session).as_deref() != Some("minimal"))
         });
-        // A stale state can still be switched back to Build; Minimal simply
-        // cannot be toggled from Build into a plan capability it does not mount.
+        // A stale state can still be switched back to Build; providers without
+        // a plan capability cannot be toggled from Build into one.
         let interactive = mode == InteractionMode::Plan || supports_plan;
+        let plan_unavailable_message = selected_session
+            .filter(|session| session.provider == ProviderKind::Fx)
+            .map_or_else(
+                || tr!("agent_preset.minimal_no_plan"),
+                |_| tr!("mode.plan_not_supported"),
+            );
         let next_mode = if mode == InteractionMode::Plan {
             InteractionMode::Build
         } else {
@@ -1784,8 +1834,8 @@ impl Waku {
             .items_center()
             .gap(px(6.0))
             .cursor_default()
-            .text_size(px(11.5))
-            .line_height(px(14.0))
+            .text_size(sp(12.5))
+            .line_height(sp(14.0))
             .text_color(if mode == InteractionMode::Plan {
                 theme.accent
             } else {
@@ -1817,9 +1867,55 @@ impl Waku {
             .when(!interactive, |element| {
                 element
                     .opacity(0.7)
-                    .tooltip(Tooltip::text(tr!("agent_preset.minimal_no_plan")))
+                    .tooltip(Tooltip::text(plan_unavailable_message))
             })
             .into_any_element()
+    }
+
+    /// The thread-goal chip: present only while the provider reports a goal,
+    /// it pairs a target icon with the status phrase (and budget consumption)
+    /// and opens the goal dialog. `/goal` is the keyboard route to the same
+    /// surface.
+    pub(super) fn render_goal_control(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let session = self.selected_session()?;
+        let goal = session.thread_goal.as_ref()?;
+        let session_id = session.id;
+        let theme = Theme::current(cx);
+        let color = super::goal_dialog::goal_status_color(goal.status, &theme);
+        // Elapsed pursuit time accrues only while a turn actually runs,
+        // matching how the provider accounts it.
+        let live_elapsed_seconds = (goal.status == crate::model::ThreadGoalStatus::Active
+            && session.is_busy())
+        .then(|| self.goal_observed_at.get(&session_id))
+        .flatten()
+        .map_or(0, |observed| observed.elapsed().as_secs() as i64);
+        let label = super::goal_dialog::goal_chip_label(goal, live_elapsed_seconds);
+        let objective = goal.objective.clone();
+        let weak = cx.entity().downgrade();
+        Some(
+            div()
+                .id("composer-goal")
+                .h(px(24.0))
+                .px(px(7.0))
+                .rounded(px(6.0))
+                .flex()
+                .items_center()
+                .gap(px(6.0))
+                .cursor_default()
+                .text_size(sp(12.5))
+                .line_height(sp(14.0))
+                .text_color(color)
+                .child(icon("icons/target.svg", 10.5, color))
+                .child(div().max_w(px(220.0)).truncate().child(label))
+                .hover(|element| element.bg(theme.overlay))
+                .tooltip(Tooltip::text(objective))
+                .on_click(move |_, _, cx| {
+                    let _ = weak.update(cx, |this, cx| {
+                        this.request_goal_dialog(session_id, None, false, cx);
+                    });
+                })
+                .into_any_element(),
+        )
     }
 
     /// Stage files dropped onto the composer as attachment chips. The mention
@@ -2034,14 +2130,21 @@ impl Waku {
     }
 
     /// The text and attachment presentation accepted from the composer. The
-    /// exact provider prompt keeps its `@` mentions, while sent-message UI uses
-    /// `display_content` and the retained attachment metadata.
+    /// stored prompt keeps its `@` mentions and visible command syntax, while
+    /// sent-message UI uses `display_content` and retained attachment metadata.
     pub(super) fn submission_with_attachments(
         &mut self,
         prompt: &str,
         cx: &mut Context<Self>,
     ) -> Option<ComposerSubmission> {
         if self.execute_local_composer_command(prompt, cx) {
+            return None;
+        }
+        // Nothing installed or switched on can run this. Refuse before the
+        // draft is consumed, so the text and its attachments survive until a
+        // provider is available — every send route lands here, so `enter`,
+        // the button, and steering are all covered by this one check.
+        if self.model_picker_has_no_providers() {
             return None;
         }
         for attachment in &self.composer_attachments {
@@ -2078,6 +2181,79 @@ impl Waku {
         prompt: &str,
         cx: &mut Context<Self>,
     ) -> bool {
+        self.execute_fast_mode_toggle(prompt, cx) || self.execute_goal_composer_command(prompt, cx)
+    }
+
+    /// Bridge Codex's native `/goal` command without starting a turn. Reads run
+    /// against the session's cached goal; mutations go to the app-server and
+    /// echo back as `GoalUpdated` events.
+    fn execute_goal_composer_command(&mut self, prompt: &str, cx: &mut Context<Self>) -> bool {
+        use crate::composer_complete::GoalCommand;
+        use crate::model::{GoalOperation, ThreadGoalStatus};
+        let Some((session_id, command, current_goal)) = self.selected_session().and_then(|session| {
+            let command = crate::composer_complete::parse_goal_submission(
+                session.provider,
+                prompt,
+                &self.slash_command_index,
+            )?;
+            Some((session.id, command, session.thread_goal.clone()))
+        }) else {
+            return false;
+        };
+        match command {
+            GoalCommand::Show | GoalCommand::Edit => {
+                self.request_goal_dialog(session_id, None, false, cx);
+            }
+            GoalCommand::Pause => {
+                self.dispatch_goal_operation(
+                    session_id,
+                    GoalOperation::Set {
+                        objective: None,
+                        status: Some(ThreadGoalStatus::Paused),
+                        replace: false,
+                    },
+                    cx,
+                );
+            }
+            GoalCommand::Resume => {
+                self.dispatch_goal_operation(
+                    session_id,
+                    GoalOperation::Set {
+                        objective: None,
+                        status: Some(ThreadGoalStatus::Active),
+                        replace: false,
+                    },
+                    cx,
+                );
+            }
+            GoalCommand::Clear => {
+                self.dispatch_goal_operation(session_id, GoalOperation::Clear, cx);
+            }
+            GoalCommand::Set(objective) => match &current_goal {
+                // Replacing unfinished work needs a look at what it replaces;
+                // the dialog carries the confirmation.
+                Some(goal) if !goal.status.is_terminal() => {
+                    self.request_goal_dialog(session_id, Some(objective), true, cx);
+                }
+                Some(_) | None => {
+                    self.dispatch_goal_operation(
+                        session_id,
+                        GoalOperation::Set {
+                            objective: Some(objective),
+                            status: Some(ThreadGoalStatus::Active),
+                            replace: current_goal.is_some(),
+                        },
+                        cx,
+                    );
+                }
+            },
+        }
+        self.composer.update(cx, |input, cx| input.clear(cx));
+        cx.notify();
+        true
+    }
+
+    fn execute_fast_mode_toggle(&mut self, prompt: &str, cx: &mut Context<Self>) -> bool {
         let Some(next_tier) = self.selected_session().and_then(|session| {
             if !crate::composer_complete::is_fast_mode_toggle_submission(
                 session.provider,
@@ -2225,7 +2401,7 @@ impl Waku {
                                 div()
                                     .max_w_full()
                                     .truncate()
-                                    .text_size(px(8.5))
+                                    .text_size(sp(12.5))
                                     .text_color(theme.text_tertiary)
                                     .child(attachment.name.clone()),
                             ),
@@ -2311,12 +2487,7 @@ impl Waku {
             return None;
         }
         let theme = Theme::current(cx);
-        let steerable = session.is_busy()
-            && session.status != SessionStatus::Connecting
-            && self
-                .runtimes
-                .get(&session.id)
-                .is_some_and(|runtime| runtime.driver.supports_steer());
+        let steerable = self.session_can_steer(session);
         let mut list = div().flex().flex_col().py(px(4.0));
         for message in &session.queued_messages {
             let message_id = message.id;
@@ -2346,7 +2517,7 @@ impl Waku {
                     .focus_visible(|style| style.border_1().border_color(theme.accent))
                     .hover(|element| element.bg(theme.overlay_strong))
                     .active(|element| element.opacity(0.8))
-                    .text_size(px(11.5))
+                    .text_size(sp(12.5))
                     .text_color(theme.text_secondary)
                     .child(icon(
                         "icons/corner-down-right.svg",
@@ -2428,7 +2599,7 @@ impl Waku {
                             .flex_1()
                             .min_w_0()
                             .truncate()
-                            .text_size(px(12.5))
+                            .text_size(sp(12.5))
                             .text_color(theme.text)
                             .child(SharedString::from(content)),
                     )
@@ -2527,10 +2698,19 @@ impl Waku {
             self.escape_stop_confirmation
                 .is_armed_for(EscapeStopTarget::for_session(session), Instant::now())
         });
-        let has_draft = !self.composer.read(cx).content().trim().is_empty()
+        let has_draft = !self.composer.read(cx).content(cx).trim().is_empty()
             || !self.composer_attachments.is_empty();
-        let autocomplete = self.render_composer_autocomplete(window, cx);
-        let autocomplete_open = autocomplete.is_some();
+        // With no provider to run it, a draft has nowhere to go. The button
+        // reads as unavailable and the submission path refuses too, so
+        // `enter` cannot slip past a disabled control.
+        let no_providers = self.model_picker_has_no_providers();
+        let can_send = has_draft && !no_providers;
+        let (autocomplete, autocomplete_actionable) =
+            match self.render_composer_autocomplete(window, cx) {
+                Some((element, actionable)) => (Some(element), actionable),
+                None => (None, false),
+            };
+        let autocomplete_loading = autocomplete.is_some() && !autocomplete_actionable;
         // Files dragged in from the OS light the card up as a drop target and
         // stage as attachment chips. The wash arrives pre-blended because a
         // drag-over refinement replaces the card's fill rather than
@@ -2561,11 +2741,11 @@ impl Waku {
                 .child(super::autocomplete::composer_card_bounds_probe(
                     self.composer_autocomplete.card_bounds_cell(),
                 ))
-                // Only while the popup is open: the key context routes the
-                // arrows, `enter`, `tab` and `escape` here as actions, out
-                // from under the focused field. When it closes, the context
-                // disappears with it and `enter` submits again.
-                .when(autocomplete_open, |card| {
+                // Only while the popup has selectable rows: the key context
+                // routes arrows, `enter`, `tab` and `escape` here as actions,
+                // out from under the focused field. The loading state takes
+                // only Escape, so it can dismiss without swallowing input.
+                .when(autocomplete_actionable, |card| {
                     card.key_context("ComposerAutocomplete")
                         .on_action(cx.listener(|this, _: &SelectNextEntry, window, cx| {
                             this.move_autocomplete_highlight("down", window, cx);
@@ -2576,6 +2756,12 @@ impl Waku {
                         .on_action(cx.listener(|this, _: &ConfirmEntry, window, cx| {
                             this.accept_autocomplete(None, window, cx);
                         }))
+                        .on_action(cx.listener(|this, _: &DismissMenu, _, cx| {
+                            this.dismiss_autocomplete(cx);
+                        }))
+                })
+                .when(autocomplete_loading, |card| {
+                    card.key_context("ComposerAutocompleteLoading")
                         .on_action(cx.listener(|this, _: &DismissMenu, _, cx| {
                             this.dismiss_autocomplete(cx);
                         }))
@@ -2592,13 +2778,14 @@ impl Waku {
                         .flex()
                         .items_center()
                         .gap(px(4.0))
-                        .text_size(px(11.5))
-                        .line_height(px(14.0))
+                        .text_size(sp(12.5))
+                        .line_height(sp(14.0))
                         .child(self.render_provider_model_control(cx))
                         .children(self.render_model_traits_control(cx))
                         .children(self.render_agent_preset_control(cx))
                         .child(self.render_access_control(cx))
                         .child(self.render_interaction_mode_control(cx))
+                        .children(self.render_goal_control(cx))
                         .child(div().flex_1())
                         .child(match submit_action {
                             ComposerSubmitAction::Preparing => div()
@@ -2638,7 +2825,7 @@ impl Waku {
                                         .when(escape_stop_armed, |element| {
                                             element.child(
                                                 div()
-                                                    .text_size(px(10.0))
+                                                    .text_size(sp(12.5))
                                                     .font_weight(FontWeight::SEMIBOLD)
                                                     .text_color(theme.text)
                                                     .child("Esc"),
@@ -2651,7 +2838,7 @@ impl Waku {
                                             this.cancel_turn(cx);
                                         })),
                                 )
-                                .when(has_draft, |element| {
+                                .when(can_send, |element| {
                                     element.child(
                                         div()
                                             .id("queue-follow-up")
@@ -2673,7 +2860,7 @@ impl Waku {
                                             .tooltip(Tooltip::text(tr!("composer.queue_followup")))
                                             .on_click(cx.listener(|this, _, _, cx| {
                                                 let prompt =
-                                                    this.composer.read(cx).content().to_owned();
+                                                    this.composer.read(cx).content(cx).to_owned();
                                                 if let Some(submission) =
                                                     this.submission_with_attachments(&prompt, cx)
                                                 {
@@ -2692,12 +2879,12 @@ impl Waku {
                                 .flex()
                                 .items_center()
                                 .justify_center()
-                                .bg(if has_draft {
+                                .bg(if can_send {
                                     theme.inverse
                                 } else {
                                     theme.overlay_strong
                                 })
-                                .when(has_draft, |element| {
+                                .when(can_send, |element| {
                                     element
                                         .cursor_default()
                                         .hover(|element| element.opacity(0.9))
@@ -2706,14 +2893,19 @@ impl Waku {
                                 .child(icon(
                                     "icons/arrow-up.svg",
                                     16.0,
-                                    if has_draft {
+                                    if can_send {
                                         theme.on_inverse
                                     } else {
                                         theme.text_ghost
                                     },
                                 ))
+                                // Says why the button is dead, for the case
+                                // the draft is ready and the machine is not.
+                                .when(no_providers, |element| {
+                                    element.tooltip(Tooltip::text(tr!("composer.no_providers")))
+                                })
                                 .on_click(cx.listener(|this, _, _, cx| {
-                                    let prompt = this.composer.read(cx).content().to_owned();
+                                    let prompt = this.composer.read(cx).content(cx).to_owned();
                                     if let Some(submission) =
                                         this.submission_with_attachments(&prompt, cx)
                                     {
@@ -2848,6 +3040,7 @@ impl Waku {
                 let next_actions = actions.clone();
                 let previous_actions = actions.clone();
                 let confirm_actions = actions.clone();
+                let dismiss_weak = weak.clone();
                 let next_weak = weak.clone();
                 let previous_weak = weak.clone();
                 let confirm_weak = weak.clone();
@@ -2862,7 +3055,7 @@ impl Waku {
                                 .flex()
                                 .items_center()
                                 .gap(px(8.0))
-                                .text_size(px(13.0))
+                                .text_size(sp(13.0))
                                 .font_weight(FontWeight::MEDIUM)
                                 .text_color(theme.text)
                                 .child(icon("icons/plus.svg", 14.0, theme.text_secondary))
@@ -2884,7 +3077,7 @@ impl Waku {
                         .child(
                             div()
                                 .mt(px(9.0))
-                                .text_size(px(10.5))
+                                .text_size(sp(12.5))
                                 .text_color(theme.text_tertiary)
                                 .child(tr!("branches.create_hint")),
                         )
@@ -2898,7 +3091,7 @@ impl Waku {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .text_size(px(11.5))
+                            .text_size(sp(12.5))
                             .text_color(theme.text_ghost)
                             .child(tr!("branches.none_found"))
                             .into_any_element()
@@ -2965,8 +3158,8 @@ impl Waku {
                                                 .min_w_0()
                                                 .flex_1()
                                                 .truncate()
-                                                .text_size(px(11.5))
-                                                .line_height(px(15.0))
+                                                .text_size(sp(12.5))
+                                                .line_height(sp(15.0))
                                                 .text_color(color)
                                                 .child(SharedString::from(branch.name.clone())),
                                         )
@@ -3027,8 +3220,8 @@ impl Waku {
                             .child(icon("icons/plus.svg", 12.0, theme.text_secondary))
                             .child(
                                 div()
-                                    .text_size(px(11.5))
-                                    .line_height(px(15.0))
+                                    .text_size(sp(12.5))
+                                    .line_height(sp(15.0))
                                     .text_color(theme.text)
                                     .child(tr!("branches.create_and_checkout_ellipsis")),
                             )
@@ -3071,7 +3264,7 @@ impl Waku {
                                 .px(px(14.0))
                                 .pt(px(3.0))
                                 .pb(px(7.0))
-                                .text_size(px(12.0))
+                                .text_size(sp(12.5))
                                 .font_weight(FontWeight::MEDIUM)
                                 .text_color(theme.text_tertiary)
                                 .child(tr!("branches.title")),
@@ -3116,6 +3309,25 @@ impl Waku {
                         if should_close {
                             confirm_popover.close(window, cx);
                             window.refresh();
+                        }
+                    })
+                    // Escape backs the create form out to browsing. The rest
+                    // of the peel is the fields' own clear-on-escape: a
+                    // non-empty filter (or typed branch name) clears before
+                    // this handler ever sees the keystroke, and an empty
+                    // browse view propagates on to the menu's own dismiss.
+                    .on_action(move |_: &DismissMenu, window, cx| {
+                        let handled = dismiss_weak
+                            .update(cx, |this, cx| {
+                                if this.branch_picker_mode == BranchPickerMode::Create {
+                                    this.cancel_branch_creation(window, cx);
+                                    return true;
+                                }
+                                false
+                            })
+                            .unwrap_or(false);
+                        if !handled {
+                            cx.propagate();
                         }
                     })
                     .child(body)
@@ -3304,8 +3516,8 @@ impl Waku {
                     .tab_index(0)
                     .tab_group()
                     .tab_stop(false)
-                    .text_size(px(11.0))
-                    .line_height(px(14.0))
+                    .text_size(sp(12.5))
+                    .line_height(sp(14.0))
                     .child(project_selector)
                     .child(worktree_selector)
                     .children(branch_selector)
@@ -3545,14 +3757,139 @@ pub(super) fn visible_picker_tabs(
 ) -> Vec<ModelPickerTab> {
     let mut tabs = vec![ModelPickerTab::Favorites];
     tabs.extend(ProviderKind::ALL.into_iter().filter_map(|kind| {
-        let installed = probes
-            .iter()
-            .any(|probe| probe.provider == kind && probe.installed);
-        let switched_off = disabled_providers.contains(&kind) && locked_provider != Some(kind);
-        let allowed = (locked_provider.is_none() || locked_provider == Some(kind)) && !switched_off;
-        (installed && allowed).then_some(ModelPickerTab::Provider(kind))
+        let drawn = picker_rail_shows_provider(probes, disabled_providers, locked_provider, kind);
+        let allowed = locked_provider.is_none() || locked_provider == Some(kind);
+        (drawn && allowed).then_some(ModelPickerTab::Provider(kind))
     }));
     tabs
+}
+
+/// The picker's whole body when nothing can back a session: no agent CLI
+/// found on this machine, and none left switched on.
+///
+/// A rail holding a lone star above an empty filter field would invite the
+/// user to search a list that cannot have rows, so the panel names what is
+/// missing and offers the page that fixes it. Its one button also carries the
+/// panel's focus, which is what `escape` dispatches up from.
+fn model_picker_empty_state(
+    theme: &Theme,
+    focus: &FocusHandle,
+    popover: ContextMenuHandle,
+    waku: WeakEntity<Waku>,
+) -> AnyElement {
+    let click_popover = popover.clone();
+    let click_waku = waku.clone();
+    div()
+        .w(px(320.0))
+        .rounded(px(13.0))
+        .overflow_hidden()
+        .border_1()
+        .border_color(theme.border_strong)
+        .bg(theme.raised)
+        .shadow_lg()
+        .flex()
+        .flex_col()
+        .items_center()
+        .gap(px(9.0))
+        .px(px(24.0))
+        .py(px(22.0))
+        .child(
+            div()
+                .w(px(40.0))
+                .h(px(40.0))
+                .rounded(px(10.0))
+                .bg(theme.overlay)
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(icon("icons/bot.svg", 19.0, theme.text_tertiary)),
+        )
+        .child(
+            div()
+                .text_size(sp(12.5))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(theme.text)
+                .child(tr!("models.no_providers_title")),
+        )
+        .child(
+            div()
+                .text_size(sp(12.5))
+                .line_height(sp(17.0))
+                .text_center()
+                .text_color(theme.text_secondary)
+                .child(tr!("models.no_providers_description")),
+        )
+        .child(
+            div()
+                .id("model-picker-open-providers")
+                .track_focus(focus)
+                .tab_index(0)
+                .tab_stop(true)
+                .focus_visible(|style| style.border_color(theme.accent))
+                .mt(px(3.0))
+                .h(px(28.0))
+                .px(px(11.0))
+                .rounded(px(7.0))
+                .border_1()
+                .border_color(theme.border_strong)
+                .flex()
+                .items_center()
+                .gap(px(6.0))
+                .cursor_default()
+                .text_size(sp(12.5))
+                .text_color(theme.text_secondary)
+                .hover(|element| element.bg(theme.overlay))
+                .child(icon("icons/settings.svg", 11.0, theme.text_tertiary))
+                .child(tr!("models.open_provider_settings"))
+                .on_click(move |_, window, cx| {
+                    open_provider_settings_from_picker(&click_waku, &click_popover, window, cx);
+                })
+                .on_key_down(move |event: &KeyDownEvent, window, cx| {
+                    if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                        open_provider_settings_from_picker(&waku, &popover, window, cx);
+                        cx.stop_propagation();
+                    }
+                }),
+        )
+        .into_any_element()
+}
+
+/// Dismiss the picker and land on the Providers page, for both the empty
+/// state's click and its keyboard activation. Closing first matters: the
+/// picker returns focus to the composer as it closes, which would otherwise
+/// pull focus straight back out of the settings view.
+fn open_provider_settings_from_picker(
+    waku: &WeakEntity<Waku>,
+    popover: &ContextMenuHandle,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    popover.close(window, cx);
+    let _ = waku.update(cx, |this, cx| {
+        this.open_settings_action(&OpenSettings, window, cx);
+        this.open_settings_page(SettingsPage::Providers, cx);
+    });
+}
+
+/// Whether the rail draws a tab for the provider at all, usable or not.
+///
+/// Installed on this machine and not switched off in the Providers settings.
+/// Both of those are settings-level facts the user has already decided, so the
+/// tab is absent rather than dimmed — the rail offers what could be picked,
+/// not a catalog of everything Waku can speak to. A session locked to a
+/// provider switched off afterwards keeps its own tab, since the picker is
+/// that session's only route to another model.
+pub(super) fn picker_rail_shows_provider(
+    probes: &[ProviderProbe],
+    disabled_providers: &[ProviderKind],
+    locked_provider: Option<ProviderKind>,
+    kind: ProviderKind,
+) -> bool {
+    let installed = probes
+        .iter()
+        .any(|probe| probe.provider == kind && probe.installed);
+    let switched_off = disabled_providers.contains(&kind) && locked_provider != Some(kind);
+    installed && !switched_off
 }
 
 pub(super) fn model_picker_subtitle(provider: ProviderKind, sub_provider: Option<&str>) -> String {
@@ -3562,6 +3899,25 @@ pub(super) fn model_picker_subtitle(provider: ProviderKind, sub_provider: Option
         Some(name) => format!("{name} · {provider_name}"),
         None => provider_name.to_owned(),
     }
+}
+
+/// Whether the picker has nothing left to offer, so the composer's trigger
+/// and the panel behind it both swap to their empty state.
+///
+/// `detection_settled` gates the whole answer. Every probe is seeded as "not
+/// installed" and detection answers off the UI thread, so a pass that has
+/// never completed means "not known yet", never "nothing here" — otherwise
+/// the trigger would flash an empty state during every launch.
+pub(super) fn picker_has_no_providers(
+    probes: &[ProviderProbe],
+    disabled_providers: &[ProviderKind],
+    locked_provider: Option<ProviderKind>,
+    detection_settled: bool,
+) -> bool {
+    detection_settled
+        && !ProviderKind::ALL.into_iter().any(|kind| {
+            picker_rail_shows_provider(probes, disabled_providers, locked_provider, kind)
+        })
 }
 
 /// The models the picker lists, in display order.

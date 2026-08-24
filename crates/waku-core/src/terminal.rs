@@ -56,11 +56,9 @@ mod platform {
             }
 
             let shell = crate::command_env::default_terminal_shell();
+            let shell_args = crate::command_env::default_terminal_shell_args(&shell);
             let mut options = tty::Options {
-                shell: Some(Shell::new(
-                    shell.to_string_lossy().into_owned(),
-                    vec!["-l".into()],
-                )),
+                shell: Some(Shell::new(shell.to_string_lossy().into_owned(), shell_args)),
                 working_directory: Some(cwd.to_owned()),
                 drain_on_exit: false,
                 ..Default::default()
@@ -165,6 +163,16 @@ mod platform {
     impl Drop for DaemonTerminal {
         fn drop(&mut self) {
             self.stopped.store(true, Ordering::Release);
+            // The output reader may be blocked in `read` while the shell is
+            // idle. Alacritty hangs the child up when its PTY is dropped, but
+            // the reader owns another `Arc` to that PTY, so waiting for the
+            // reader first would keep both the child and its slave fd alive.
+            // Terminate the shell before joining so the master read wakes and
+            // the reader can observe `stopped`.
+            let child_pid = self.pty.lock().child().id() as libc::pid_t;
+            unsafe {
+                libc::kill(child_pid, libc::SIGHUP);
+            }
             if let Some(reader) = self.reader.take() {
                 let _ = reader.join();
             }

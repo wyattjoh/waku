@@ -2,6 +2,7 @@ import { useQueryClient } from '@tanstack/react-query'
 import type {
   AgentSession,
   DaemonSettings,
+  GoalOperation,
   MessageAttachment,
   PlanUsage,
   Project,
@@ -123,6 +124,7 @@ interface RuntimeContextValue {
     attachments?: MessageAttachment[],
     providerPromptOverride?: string,
   ) => Promise<void>
+  sendGoalOperation: (session: AgentSession, operation: GoalOperation) => Promise<void>
   cancel: (sessionId: string) => Promise<void>
   closeSession: (sessionId: string) => Promise<void>
   removeQueuedMessage: (sessionId: string, messageId: string) => Promise<void>
@@ -786,6 +788,213 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
     ],
   )
 
+  /**
+   * Read or mutate the session's provider-persisted thread goal. Goals attach
+   * to the provider thread, not to any turn — the Codex CLI starts its thread
+   * at launch, so `/goal` works there before the first message. When no
+   * runtime exists yet this starts one without beginning a turn; the daemon
+   * socket serializes the start request ahead of the goal command.
+   */
+  const sendGoalOperation = useCallback(
+    async (inputSession: AgentSession, operation: GoalOperation) => {
+      if (!client || !config || phase !== 'connected') {
+        throw new Error(translate(localeRef.current, 'errors.daemon_disconnected'))
+      }
+      const currentSession = queryClient.getQueryData<AgentSession>(
+        daemonKeys.session(config.address, inputSession.id),
+      ) ?? inputSession
+      // Activating a goal on an idle thread makes Codex pursue it right away,
+      // so begin its turn optimistically — the way a submission's turn begins
+      // at accept — instead of showing the empty-task page until the
+      // provider's start report arrives. `turnStarted` confirms it; errors
+      // and the watchdog below unwind an unconfirmed one. A submitted
+      // objective also leaves a persistent transcript record — the centered
+      // pill a system message renders as. Pushed turn-less so it survives an
+      // unwound pursuit.
+      const activating = operation.kind === 'set' && operation.status === 'active'
+      const objective = operation.kind === 'set' ? operation.objective : null
+      const idle = !['connecting', 'working', 'waiting'].includes(currentSession.status)
+        && currentSession.turns.at(-1)?.status !== 'running'
+      const now = Math.floor(Date.now() / 1_000)
+      let restoreOnFailure: AgentSession | null = null
+      let optimisticSession: AgentSession | null = null
+      if (objective || (activating && idle)) {
+        restoreOnFailure = currentSession
+        optimisticSession = {
+          ...currentSession,
+          messages: [...currentSession.messages],
+          turns: [...currentSession.turns],
+          updated_at: now,
+        }
+        if (objective) {
+          if (
+            optimisticSession.title === 'New task'
+            && !optimisticSession.auto_title
+            && !optimisticSession.messages.some((message) => message.role === 'user')
+          ) {
+            optimisticSession.auto_title = objective.split(/\s+/u).filter(Boolean).slice(0, 7).join(' ') || null
+          }
+          optimisticSession.messages.push({
+            id: crypto.randomUUID(),
+            turn_id: null,
+            role: 'system',
+            content: translate(localeRef.current, 'goal.set_notice', {
+              objective: noticeObjective(objective),
+            }),
+            created_at: now,
+            streaming: false,
+          })
+        }
+        if (activating && idle) {
+          const pursuitTurnId = crypto.randomUUID()
+          optimisticSession.status = 'connecting'
+          optimisticSession.turns.push({
+            id: pursuitTurnId,
+            turn_count: optimisticSession.turns.length + 1,
+            status: 'running',
+            provider_turn_started: false,
+            provider_resume_at: null,
+            started_at: now,
+            completed_at: null,
+            checkpoint: null,
+          })
+          window.setTimeout(() => {
+            const cached = queryClient.getQueryData<AgentSession>(
+              daemonKeys.session(config.address, currentSession.id),
+            )
+            const pursuit = cached?.turns.at(-1)
+            if (
+              cached && pursuit && pursuit.id === pursuitTurnId
+              && pursuit.status === 'running'
+              && !pursuit.provider_turn_started
+              && !cached.messages.some((message) => message.turn_id === pursuit.id)
+            ) {
+              cacheSession({
+                ...cached,
+                status: 'idle',
+                turns: cached.turns.slice(0, -1),
+              })
+            }
+          }, 30_000)
+        }
+        cacheSession(optimisticSession)
+        optimisticSession = await persistOrdered(optimisticSession)
+        cacheSession(optimisticSession)
+      }
+      try {
+        if (!entries.current.has(currentSession.id)) {
+          await attachSession(currentSession)
+        }
+        const attached = entries.current.get(currentSession.id)
+        if (attached) {
+          await client.notify({ type: 'goal', operation }, currentSession.id, attached.runtimeId)
+          return
+        }
+      } catch (error) {
+        if (restoreOnFailure) cacheSession(restoreOnFailure)
+        throw error
+      }
+
+      const state = await loadTaskState(client)
+      const project = state.projects.find((item) => item.id === currentSession.project_id)
+      if (!project) {
+        throw new Error(translate(localeRef.current, 'errors.task_project_not_found'))
+      }
+      const settings = await queryClient.fetchQuery({
+        queryKey: daemonKeys.settings(config.address),
+        queryFn: () => loadDaemonSettings(client),
+        staleTime: 60_000,
+      })
+      const binaryOverride = settings.provider_binary_overrides?.[currentSession.provider] ?? null
+      const providerProbe = await queryClient.fetchQuery({
+        queryKey: daemonKeys.provider(config.address, currentSession.provider, binaryOverride),
+        queryFn: async () => {
+          const data = await probeProvider(client, currentSession.provider, settings)
+          writeProviderProbeCache(
+            browserProviderProbeStorage(),
+            config.address,
+            currentSession.provider,
+            binaryOverride,
+            data,
+          )
+          return data
+        },
+        staleTime: PROVIDER_PROBE_CACHE_STALE_TIME,
+      })
+      if (!providerProbe.installed || !providerProbe.path) {
+        throw new Error(translate(localeRef.current, 'errors.provider_not_installed', {
+          provider: providerName(currentSession.provider),
+        }))
+      }
+      // A fresh worktree task names its branch after the first prompt; when
+      // the goal arrives first, the objective is that intent.
+      const namingPrompt = operation.kind === 'set' && operation.objective
+        ? operation.objective
+        : 'goal'
+      let session = await materializeWorktree(
+        client,
+        optimisticSession ?? currentSession,
+        project,
+        namingPrompt,
+      )
+      session = await persistOrdered(session)
+      cacheSession(session)
+      const runtimeId = crypto.randomUUID()
+      const runtime = subscribe(session, runtimeId)
+      try {
+        const response = await client.request(
+          {
+            type: 'start',
+            options: {
+              provider: session.provider,
+              binary: providerProbe.path,
+              cwd: sessionCwd(session, project),
+              mode: session.runtime_mode,
+              interactionMode: session.interaction_mode,
+              model: session.model ?? null,
+              reasoningEffort: session.reasoning_effort ?? null,
+              serviceTier: session.service_tier ?? null,
+              contextWindow: session.context_window ?? null,
+              agentPreset: session.agent_preset ?? null,
+              computerUseEnabled: false,
+              providerCursor: session.provider_cursor as never,
+            },
+          },
+          session.id,
+          runtimeId,
+        )
+        if (response.type !== 'started') {
+          throw new Error(translate(localeRef.current, 'errors.unexpected_daemon_response', {
+            expected: 'started',
+            actual: response.type,
+          }))
+        }
+        runtime.supportsSteer = response.supportsSteer
+        runtime.starting = false
+        setRuntimes((current) => ({
+          ...current,
+          [session.id]: publicRuntime(runtime),
+        }))
+        await client.notify({ type: 'goal', operation }, session.id, runtimeId)
+      } catch (error) {
+        removeRuntime(session.id)
+        if (restoreOnFailure) cacheSession(restoreOnFailure)
+        throw error
+      }
+    },
+    [
+      client,
+      config,
+      phase,
+      queryClient,
+      cacheSession,
+      attachSession,
+      subscribe,
+      removeRuntime,
+      persistOrdered,
+    ],
+  )
+
   sendPromptRef.current = sendPrompt
 
   const steerPrompt = useCallback<RuntimeContextValue['steerPrompt']>(
@@ -1105,6 +1314,7 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
     messageRewinds,
     attachSession,
     sendPrompt,
+    sendGoalOperation,
     steerPrompt,
     cancel,
     closeSession,
@@ -1126,6 +1336,14 @@ function removeRecordKey<T>(record: Record<string, T>, key: string): Record<stri
   const next = { ...record }
   delete next[key]
   return next
+}
+
+/** The objective as a transcript notice: whole when short, elided past 120
+ * characters — the chip tooltip and dialog carry the full text. */
+function noticeObjective(objective: string): string {
+  const characters = [...objective]
+  if (characters.length <= 120) return objective
+  return `${characters.slice(0, 119).join('').trimEnd()}…`
 }
 
 function queueSubmission(
@@ -1222,8 +1440,11 @@ function providerName(provider: AgentSession['provider']) {
       codex: 'Codex',
       cursor: 'Cursor Agent',
       deepSeek: 'DeepSeek Harness',
+      fx: 'Fx',
       openCode: 'OpenCode',
       grok: 'Grok',
+      kimi: 'Kimi',
+      ohMyPi: 'Oh My Pi',
       pi: 'Pi',
     } as const
   )[provider]

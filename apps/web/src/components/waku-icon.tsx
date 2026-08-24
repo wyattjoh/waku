@@ -53,6 +53,7 @@ export const WAKU_ICONS = {
   star: 'i-waku-star',
   starFilled: 'i-waku-star-filled',
   stop: 'i-waku-stop',
+  target: 'i-waku-target',
   stopFilled: 'i-waku-stop-filled',
   terminal: 'i-waku-terminal',
   terminalSquare: 'i-waku-terminal-square',
@@ -328,8 +329,11 @@ const PROVIDER_ICONS: Record<ProviderKind, string> = {
   codex: 'i-waku-provider-openai',
   cursor: 'i-waku-provider-cursor',
   deepSeek: 'i-waku-provider-deepseek',
+  fx: 'i-waku-provider-fx',
   openCode: 'i-waku-provider-opencode',
   grok: 'i-waku-provider-grok',
+  kimi: 'i-waku-provider-kimi',
+  ohMyPi: 'i-waku-provider-ohmypi',
   pi: 'i-waku-provider-pi',
 }
 
@@ -344,8 +348,11 @@ export const PROVIDERS: Array<{
   { id: 'codex', name: 'Codex CLI', shortName: 'Codex', command: 'codex' },
   { id: 'cursor', name: 'Cursor CLI', shortName: 'Cursor', command: 'cursor-agent' },
   { id: 'deepSeek', name: 'DeepSeek Harness', shortName: 'DeepSeek', command: 'dsh' },
+  { id: 'fx', name: 'Fx', shortName: 'Fx', command: 'fx' },
   { id: 'openCode', name: 'OpenCode', shortName: 'OpenCode', command: 'opencode' },
   { id: 'grok', name: 'Grok Build', shortName: 'Grok', command: 'grok' },
+  { id: 'kimi', name: 'Kimi Code', shortName: 'Kimi', command: 'kimi' },
+  { id: 'ohMyPi', name: 'Oh My Pi', shortName: 'Oh My Pi', command: 'omp' },
   { id: 'pi', name: 'Pi', shortName: 'Pi', command: 'pi' },
 ]
 

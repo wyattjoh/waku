@@ -11,6 +11,7 @@ import type { RuntimeEventCursor } from "./RuntimeEventCursor";
 import type { RuntimeMode } from "./RuntimeMode";
 import type { SessionStatus } from "./SessionStatus";
 import type { SessionWorkspace } from "./SessionWorkspace";
+import type { ThreadGoal } from "./ThreadGoal";
 import type { TranscriptBlock } from "./TranscriptBlock";
 
 export type AgentSession = { id: string,
@@ -54,6 +55,12 @@ last_reply_at?: number | null, provider_cursor: ProviderResumeCursor | null,
  * handshake.
  */
 available_commands?: Array<ReportedCommand>,
+/**
+ * The provider-persisted goal for this session's thread, kept so a
+ * resumed session shows its goal before the runtime reconnects.
+ * Currently populated by Codex.
+ */
+thread_goal?: ThreadGoal | null,
 /**
  * Context-window occupancy from the live stream, kept so a resumed
  * session's meter starts where the conversation left off.

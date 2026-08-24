@@ -28,7 +28,7 @@ fn start_driver(mut request: DriverStartRequest, cwd: PathBuf) -> anyhow::Result
     request.options.cwd = cwd;
     let (event_tx, events) = driver::event_channel(request.event_wake);
     let handle = driver::start_remote(
-        request.daemon_client,
+        request.daemon,
         request.session_id,
         request.provider,
         request.options,
@@ -45,10 +45,8 @@ fn attach_driver(
     let Some(session) = waku_client::persistence::hydrate_session(&daemon, session_id)? else {
         return Ok(None);
     };
-    let response =
-        daemon
-            .client()
-            .request(session_id, Uuid::nil(), waku_client::Command::AttachSession)?;
+    let client = daemon.client();
+    let response = client.request(session_id, Uuid::nil(), waku_client::Command::AttachSession)?;
     let waku_client::ResponsePayload::SessionRuntime {
         runtime_id,
         supports_steer,
@@ -61,7 +59,8 @@ fn attach_driver(
     };
     let (event_tx, events) = driver::event_channel(event_wake);
     let handle = driver::attach_remote(
-        daemon.client(),
+        daemon,
+        client,
         session_id,
         runtime_id,
         supports_steer,
@@ -91,6 +90,14 @@ fn load_remote_task_state(
         session.detail_loaded = false;
     }
     Ok(RemoteTaskStateSnapshot { projects, sessions })
+}
+
+pub(super) fn session_has_active_provider_turn(session: &AgentSession) -> bool {
+    session.is_busy()
+        && session
+            .turns
+            .last()
+            .is_some_and(|turn| turn.status == TurnStatus::Running && turn.provider_turn_started)
 }
 
 /// Merge the daemon's list-only session projection into the desktop catalog.
@@ -528,7 +535,7 @@ fn perform_provider_rewind(
                 .cursor;
             Ok((Some(cursor), None, None))
         }
-        ProviderKind::Codex | ProviderKind::DeepSeek | ProviderKind::Pi => {
+        ProviderKind::Codex | ProviderKind::DeepSeek | ProviderKind::OhMyPi | ProviderKind::Pi => {
             let mut prepared_driver = None;
             let driver = if let Some(driver) = request.driver.as_ref() {
                 driver.clone()
@@ -547,6 +554,12 @@ fn perform_provider_rewind(
             let cursor = driver.rollback(request.rollback_turns)?;
             Ok((cursor, None, prepared_driver))
         }
+        // Unreachable through the UI, which hides rewinding for providers that
+        // answer `supports_conversation_rollback` with false.
+        ProviderKind::Fx | ProviderKind::Kimi => Err(anyhow::anyhow!(tr!(
+            "errors.provider_turn_branching_unsupported",
+            provider = provider.display_name()
+        ))),
     }
 }
 
@@ -808,11 +821,36 @@ fn perform_response_fork(mut request: ResponseForkRequest) -> Result<PreparedRes
                         ..
                     })
                 ) {
-                    anyhow::bail!(tr!("errors.pi_session_file_unavailable"));
+                    anyhow::bail!(tr!(
+                        "errors.provider_session_file_unavailable",
+                        provider = "Pi"
+                    ));
                 }
                 let (cursor, prepared_driver) = fork_response_with_driver(&mut request)?;
                 Ok((cursor, None, prepared_driver))
             }
+            ProviderKind::OhMyPi => {
+                if !matches!(
+                    request.source.provider_cursor.as_ref(),
+                    Some(ProviderResumeCursor::OhMyPi {
+                        session_file: Some(_),
+                        ..
+                    })
+                ) {
+                    anyhow::bail!(tr!(
+                        "errors.provider_session_file_unavailable",
+                        provider = "Oh My Pi"
+                    ));
+                }
+                let (cursor, prepared_driver) = fork_response_with_driver(&mut request)?;
+                Ok((cursor, None, prepared_driver))
+            }
+            // Unreachable through the UI, which hides branching for providers
+            // that answer `supports_conversation_fork` with false.
+            ProviderKind::Fx | ProviderKind::Kimi => anyhow::bail!(tr!(
+                "errors.provider_turn_branching_unsupported",
+                provider = provider.display_name()
+            )),
         }
     })();
 
@@ -955,6 +993,7 @@ impl Waku {
             self.runtimes.remove(session_id);
             self.background_work.remove(session_id);
             self.remove_right_panel_session_state(*session_id);
+            self.task_switcher.remove(*session_id);
         }
         self.state.projects = snapshot.projects;
 
@@ -1489,6 +1528,23 @@ impl Waku {
                 .is_some_and(|probe| probe.installed)
     }
 
+    /// Whether the model picker has no provider left to offer — nothing
+    /// detected on this machine, or everything switched off — so the
+    /// composer's trigger, the picker panel, and the send button all swap to
+    /// their unavailable state.
+    pub(super) fn model_picker_has_no_providers(&self) -> bool {
+        let locked_provider = self
+            .selected_session()
+            .filter(|session| !session.messages.is_empty())
+            .map(|session| session.provider);
+        super::composer::picker_has_no_providers(
+            &self.probes,
+            &self.state.disabled_providers,
+            locked_provider,
+            self.provider_detection_checked_at.is_some(),
+        )
+    }
+
     pub(super) fn model_for_session<'a>(&'a self, session: &'a AgentSession) -> Option<&'a str> {
         session.model.as_deref().or_else(|| {
             self.provider_probe(session.provider)
@@ -1813,7 +1869,7 @@ impl Waku {
         }
         let driver_start = if matches!(
             provider,
-            ProviderKind::Codex | ProviderKind::DeepSeek | ProviderKind::Pi
+            ProviderKind::Codex | ProviderKind::DeepSeek | ProviderKind::OhMyPi | ProviderKind::Pi
         ) && driver.is_none()
         {
             match self.driver_start_request_for_session(&source, source_workspace_path.clone()) {
@@ -1877,10 +1933,10 @@ impl Waku {
         } = match result {
             Ok(prepared) => prepared,
             Err(error) => {
-                if provider == ProviderKind::Pi {
-                    // A failed restore after Pi creates a fork can leave the
-                    // resident RPC process on that fork. Recreate it lazily
-                    // from the source cursor on its next prompt.
+                if matches!(provider, ProviderKind::Pi | ProviderKind::OhMyPi) {
+                    // A failed restore after one of these creates a fork can
+                    // leave the resident RPC process on that fork. Recreate it
+                    // lazily from the source cursor on its next prompt.
                     if let Some(runtime) = self.runtimes.remove(&session_id) {
                         runtime.driver.close();
                     }
@@ -1934,7 +1990,7 @@ impl Waku {
             let _ = waku.update(cx, |waku, cx| {
                 if waku.state.selected_session == Some(session_id) {
                     composer.update(cx, |input, cx| {
-                        if input.content().is_empty() {
+                        if input.content(cx).is_empty() {
                             input.set_content(prompt, cx);
                         }
                     });
@@ -1946,11 +2002,15 @@ impl Waku {
 
     pub(super) fn begin_message_edit(
         &mut self,
-        session_id: Uuid,
-        turn_count: usize,
+        action: UserMessageAction,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let UserMessageAction {
+            session_id,
+            message_id,
+            turn_count,
+        } = action;
         let Some((message_index, initial_message, attachments)) = self
             .state
             .sessions
@@ -1970,7 +2030,9 @@ impl Waku {
                     .iter()
                     .enumerate()
                     .find_map(|(index, message)| {
-                        (message.turn_id == Some(turn.id) && message.role == MessageRole::User)
+                        (message.id == message_id
+                            && message.turn_id == Some(turn.id)
+                            && message.role == MessageRole::User)
                             .then(|| {
                                 (
                                     index,
@@ -1986,7 +2048,7 @@ impl Waku {
             return;
         };
 
-        let input = cx.new(|cx| ComposerInput::new(window, cx).padding_x(px(12.0)));
+        let input = cx.new(|cx| ComposerInput::new(window, cx).padding_x(px(12.0), cx));
         input.update(cx, |input, cx| input.set_content(initial_message, cx));
         cx.subscribe(
             &input,
@@ -1999,6 +2061,7 @@ impl Waku {
                 ComposerEvent::SubmitSteer(prompt) => {
                     this.submit_message_edit_prompt(prompt.clone(), cx)
                 }
+                ComposerEvent::SteerQueued => {}
                 ComposerEvent::Edited => cx.notify(),
                 ComposerEvent::Focus => {}
                 ComposerEvent::BackspaceOnEmpty => {}
@@ -2007,6 +2070,7 @@ impl Waku {
         .detach();
         self.message_edit = Some(MessageEdit {
             session_id,
+            message_id,
             turn_count,
             input: input.clone(),
             attachments,
@@ -2030,14 +2094,10 @@ impl Waku {
             return;
         };
         let message_index = self.selected_session().and_then(|session| {
-            let turn_id = session
-                .turns
+            session
+                .messages
                 .iter()
-                .find(|turn| turn.turn_count == edit.turn_count)?
-                .id;
-            session.messages.iter().position(|message| {
-                message.turn_id == Some(turn_id) && message.role == MessageRole::User
-            })
+                .position(|message| message.id == edit.message_id)
         });
         if let Some(message_index) = message_index {
             self.remeasure_transcript_message(message_index);
@@ -2051,7 +2111,7 @@ impl Waku {
         let prompt = self
             .message_edit
             .as_ref()
-            .map(|edit| edit.input.read(cx).content().to_owned())
+            .map(|edit| edit.input.read(cx).content(cx).to_owned())
             .unwrap_or_default();
         self.submit_message_edit_prompt(prompt, cx);
     }
@@ -2182,7 +2242,10 @@ impl Waku {
         let driver_start = if rollback_turns > 0
             && matches!(
                 source.provider,
-                ProviderKind::Codex | ProviderKind::DeepSeek | ProviderKind::Pi
+                ProviderKind::Codex
+                    | ProviderKind::DeepSeek
+                    | ProviderKind::OhMyPi
+                    | ProviderKind::Pi
             )
             && driver.is_none()
         {
@@ -2203,19 +2266,17 @@ impl Waku {
         let provider_cursor = source.provider_cursor.clone();
         let session_title = source.display_title().to_owned();
         let cursor_source = (provider == ProviderKind::Cursor).then(|| source.clone());
-        let Some((edited_message_index, edited_message_id)) = source
+        let edited_message_id = edit.message_id;
+        let Some(edited_message_index) = source
             .turns
             .iter()
             .find(|turn| turn.turn_count == turn_count)
             .and_then(|turn| {
-                source
-                    .messages
-                    .iter()
-                    .enumerate()
-                    .find_map(|(index, message)| {
-                        (message.turn_id == Some(turn.id) && message.role == MessageRole::User)
-                            .then_some((index, message.id))
-                    })
+                source.messages.iter().position(|message| {
+                    message.id == edited_message_id
+                        && message.turn_id == Some(turn.id)
+                        && message.role == MessageRole::User
+                })
             })
         else {
             self.show_toast(tr!("session.message_unavailable"));
@@ -2325,13 +2386,10 @@ impl Waku {
                 }
                 if selected
                     && let Some(message_index) = self.selected_session().and_then(|session| {
-                        let turn = session
-                            .turns
+                        session
+                            .messages
                             .iter()
-                            .find(|turn| turn.turn_count == turn_count)?;
-                        session.messages.iter().position(|message| {
-                            message.turn_id == Some(turn.id) && message.role == MessageRole::User
-                        })
+                            .position(|message| message.id == edited_message_id)
                     })
                 {
                     self.remeasure_transcript_message(message_index);
@@ -2528,7 +2586,7 @@ impl Waku {
 
     /// Releases provider processes for sessions nobody has touched in a while.
     ///
-    /// Codex and Pi keep a process resident between turns, so an abandoned task
+    /// Codex, Pi and Oh My Pi keep a process resident between turns, so an abandoned task
     /// otherwise holds an agent — and, with Computer Use on, a whole process
     /// tree — for as long as the app runs. Recreating a runtime is exactly the
     /// work the next prompt already does after Stop, and the resume cursor is
@@ -2645,8 +2703,171 @@ impl Waku {
                 provider_cursor: session.provider_cursor.clone(),
             },
             event_wake: self.event_wake_tx.clone(),
-            daemon_client: self.daemon.client(),
+            daemon: self.daemon.clone(),
         })
+    }
+
+    /// Start the session's provider runtime for a goal operation, without a
+    /// prompt or a turn. Goals live on the provider thread itself, so this
+    /// mirrors the Codex CLI, whose thread starts at launch: prepare the
+    /// workspace, spawn the provider, and let the queued goal operations
+    /// drain once the runtime installs. The session stays `Idle` throughout —
+    /// no turn begins and nothing lands in the transcript.
+    pub(super) fn start_goal_runtime(&mut self, session_id: Uuid, cx: &mut Context<Self>) {
+        if self.runtimes.contains_key(&session_id)
+            || self.goal_runtime_starts.contains(&session_id)
+            || self.submission_preparations.contains(&session_id)
+        {
+            // An installed or installing runtime picks the queue up when the
+            // install path drains pending goal operations.
+            return;
+        }
+        let Some(session) = self
+            .state
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+        else {
+            self.pending_goal_operations.remove(&session_id);
+            return;
+        };
+        let project_id = session.project_id;
+        let workspace = session.workspace.clone();
+        let next_turn_count = session.turns.len() + 1;
+        let provisional_cwd = self
+            .workspace_path_for_session(session)
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
+        let driver_start = self.driver_start_request_for_session(session, provisional_cwd);
+        let Some(project) = self
+            .state
+            .projects
+            .iter()
+            .find(|project| project.id == project_id)
+            .cloned()
+        else {
+            self.pending_goal_operations.remove(&session_id);
+            self.show_toast(tr!("errors.prepare_task_project_not_found"));
+            cx.notify();
+            return;
+        };
+        // A fresh worktree task names its branch after the first prompt; when
+        // the goal arrives first, the objective is that intent.
+        let naming_prompt = self
+            .pending_goal_operations
+            .get(&session_id)
+            .into_iter()
+            .flatten()
+            .rev()
+            .find_map(|operation| match operation {
+                crate::model::GoalOperation::Set {
+                    objective: Some(objective),
+                    ..
+                } => Some(objective.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| tr!("goal.title"));
+        self.goal_runtime_starts.insert(session_id);
+        cx.notify();
+        let workspace_client = waku_client::WorkspaceClient::new(self.daemon.client());
+        cx.spawn(async move |waku, cx| {
+            let prepared = cx
+                .background_executor()
+                .spawn(async move {
+                    prepare_submission(
+                        workspace_client,
+                        project,
+                        workspace,
+                        Some(driver_start),
+                        session_id,
+                        &naming_prompt,
+                        next_turn_count,
+                    )
+                })
+                .await;
+            let _ = waku.update(cx, move |waku, cx| {
+                waku.finish_goal_runtime_start(session_id, prepared, cx);
+            });
+        })
+        .detach();
+    }
+
+    fn finish_goal_runtime_start(
+        &mut self,
+        session_id: Uuid,
+        prepared: anyhow::Result<PreparedSubmission>,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.goal_runtime_starts.remove(&session_id) {
+            return;
+        }
+        let prepared = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                // The goal is lost but nothing else is: messages queued
+                // behind this start resubmit through the ordinary path,
+                // which starts its own runtime.
+                self.pending_goal_operations.remove(&session_id);
+                self.unwind_unconfirmed_pursuit_turn(session_id);
+                self.show_toast(error.to_string());
+                self.drain_queued_message(session_id, cx);
+                cx.notify();
+                return;
+            }
+        };
+        let PreparedSubmission {
+            workspace,
+            checkpoint_warning: _,
+            driver,
+        } = prepared;
+        if !self
+            .state
+            .sessions
+            .iter()
+            .any(|session| session.id == session_id)
+        {
+            // The task was removed while its provider was starting.
+            self.pending_goal_operations.remove(&session_id);
+            if let Some(Ok(prepared)) = driver {
+                prepared.handle.close();
+            }
+            return;
+        }
+        let workspace_changed = self.state.session_mut(session_id).is_some_and(|session| {
+            let changed = session.workspace != workspace;
+            session.workspace = workspace;
+            changed
+        });
+        if workspace_changed && self.state.selected_session == Some(session_id) {
+            self.invalidate_workspace_queries(cx);
+            self.reload_clean_right_panel_file_editors(cx);
+            self.ensure_right_panel_terminals(cx);
+        }
+        match driver {
+            Some(Ok(prepared)) => {
+                if self.runtimes.contains_key(&session_id) {
+                    // Another path installed a runtime meanwhile; that thread
+                    // is the session's, so the goal routes there instead.
+                    prepared.handle.close();
+                    self.drain_pending_goal_operations(session_id);
+                } else {
+                    // Install drains the pending operations itself.
+                    self.install_prepared_driver(session_id, prepared);
+                }
+            }
+            None => self.drain_pending_goal_operations(session_id),
+            Some(Err(error)) => {
+                self.pending_goal_operations.remove(&session_id);
+                self.unwind_unconfirmed_pursuit_turn(session_id);
+                self.show_toast(error.to_string());
+                self.drain_queued_message(session_id, cx);
+                cx.notify();
+                return;
+            }
+        }
+        self.save();
+        self.drain_queued_message(session_id, cx);
+        cx.notify();
     }
 
     fn install_prepared_driver(
@@ -2681,6 +2902,10 @@ impl Waku {
         // the runtime map. Wake once after installation so those buffered
         // events cannot be stranded behind an already-consumed edge.
         signal_event_pump(&self.event_wake_tx);
+        // Goal operations accepted while no runtime existed ride the first
+        // install, whichever path performed it. The driver applies them once
+        // its thread opens, before any queued prompt.
+        self.drain_pending_goal_operations(session_id);
         handle
     }
 
@@ -2722,22 +2947,43 @@ impl Waku {
         // A turn that has not reached the provider yet cannot be steered; the
         // driver reports the outcome asynchronously via SteerAccepted or
         // SteerRejected once it is handed off.
-        let steerable = session.status != SessionStatus::Connecting
-            && self
-                .runtimes
-                .get(&session.id)
-                .is_some_and(|runtime| runtime.driver.supports_steer());
-        if !steerable {
+        if !self.session_can_steer(&session) {
             self.enqueue_follow_up_submission(session.id, submission, cx);
             return;
         }
+        let provider_prompt = self.resolve_skill_submission(session.provider, &submission.prompt);
         if let Some(runtime) = self.runtimes.get_mut(&session.id) {
-            runtime.driver.steer(submission.prompt.clone());
+            runtime.driver.steer(provider_prompt);
             runtime.pending_steers.push_back(submission);
         } else {
             self.enqueue_follow_up_submission(session.id, submission, cx);
         }
         cx.notify();
+    }
+
+    pub(super) fn session_can_steer(&self, session: &AgentSession) -> bool {
+        session_has_active_provider_turn(session)
+            && self
+                .runtimes
+                .get(&session.id)
+                .is_some_and(|runtime| runtime.driver.supports_steer())
+    }
+
+    /// Resolve presentation-preserving composer syntax immediately before a
+    /// prompt crosses into a provider transport.
+    fn resolve_provider_submission(&self, provider: ProviderKind, prompt: &str) -> String {
+        crate::composer_complete::resolved_submission(provider, prompt, &self.slash_command_index)
+            .unwrap_or_else(|| prompt.to_owned())
+    }
+
+    /// Resolve only provider-native skill syntax for a live steering message.
+    fn resolve_skill_submission(&self, provider: ProviderKind, prompt: &str) -> String {
+        crate::composer_complete::resolved_skill_submission(
+            provider,
+            prompt,
+            &self.slash_command_index,
+        )
+        .unwrap_or_else(|| prompt.to_owned())
     }
 
     pub(super) fn enqueue_follow_up_submission(
@@ -2823,6 +3069,21 @@ impl Waku {
         self.steer_composer_submission(ComposerSubmission::from_queued_message(message), cx);
     }
 
+    /// Activate the same action as the oldest queued row's Steer control.
+    /// When that control is unavailable, leave the queue untouched rather
+    /// than removing and re-queueing its first message at the back.
+    pub(super) fn steer_oldest_queued_message(&mut self, cx: &mut Context<Self>) {
+        let Some((session_id, message_id)) = self.selected_session().and_then(|session| {
+            if !self.session_can_steer(session) {
+                return None;
+            }
+            Some((session.id, session.queued_messages.first()?.id))
+        }) else {
+            return;
+        };
+        self.steer_queued_message(session_id, message_id, cx);
+    }
+
     /// Start the next queued follow-up as a fresh turn. Only called once a
     /// settled turn has been fully closed, so the session is Idle.
     fn drain_queued_message(&mut self, session_id: Uuid, cx: &mut Context<Self>) {
@@ -2840,6 +3101,9 @@ impl Waku {
         if session.is_busy()
             || session.queued_messages.is_empty()
             || self.ending_checkpoint_pending(session_id)
+            // Messages parked behind a goal-initiated provider start stay
+            // queued until that runtime installs.
+            || self.goal_runtime_starts.contains(&session_id)
         {
             return;
         }
@@ -2876,6 +3140,14 @@ impl Waku {
             return;
         };
         if self.ending_checkpoint_pending(session_id) {
+            self.enqueue_follow_up_submission(session_id, submission, cx);
+            self.defer_queue_drain(session_id);
+            return;
+        }
+        // A goal operation is already starting this session's provider.
+        // Queue the message so it lands on that thread — after the goal —
+        // instead of racing a second provider process into existence.
+        if self.goal_runtime_starts.contains(&session_id) {
             self.enqueue_follow_up_submission(session_id, submission, cx);
             self.defer_queue_drain(session_id);
             return;
@@ -3142,15 +3414,19 @@ impl Waku {
         if selected && let Some(warning) = checkpoint_warning {
             self.show_toast(warning);
         }
-        // Template commands expand here, at the seam between the transcript
-        // and the transport: the user message keeps the typed `/name …` —
-        // the same echo the CLIs show — while the provider receives the
-        // rendered prompt. Claude's commands pass through untouched; its CLI
-        // owns their expansion.
+        let provider = self
+            .state
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+            .map(|session| session.provider)
+            .unwrap_or(self.state.last_provider);
+        // Provider syntax resolves here, at the seam between the transcript
+        // and the transport. The user message keeps the typed slash form,
+        // while templates expand and skills adopt provider-native syntax.
+        // Claude's commands pass through untouched; its CLI owns expansion.
         let prompt = submission.prompt;
-        let driver_prompt =
-            crate::composer_complete::expanded_submission(&prompt, &self.slash_command_index)
-                .unwrap_or(prompt);
+        let driver_prompt = self.resolve_provider_submission(provider, &prompt);
         let mut failed_to_start = false;
         match driver {
             Ok(driver) => driver.prompt(driver_prompt),

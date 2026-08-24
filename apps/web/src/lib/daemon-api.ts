@@ -55,8 +55,12 @@ export const daemonKeys = {
   composerSources: (address: string) => ['daemon', address, 'composer-sources'] as const,
   composerFiles: (address: string, cwd: string) =>
     [...daemonKeys.composerSources(address), 'files', cwd] as const,
-  slashCommands: (address: string, provider: ProviderKind, cwd: string) =>
-    [...daemonKeys.composerSources(address), 'commands', provider, cwd] as const,
+  slashCommands: (
+    address: string,
+    provider: ProviderKind,
+    cwd: string,
+    binaryOverride: string | null,
+  ) => [...daemonKeys.composerSources(address), 'commands', provider, cwd, binaryOverride] as const,
   workspaceTree: (address: string, cwd: string, expanded: string[]) =>
     ['daemon', address, 'workspace-tree', cwd, ...[...expanded].sort()] as const,
   directory: (address: string, path: string | null) =>
@@ -384,11 +388,13 @@ export async function discoverComposerCommands(
   client: WakuClient,
   provider: ProviderKind,
   projectRoot: string,
+  binaryOverride: string | null,
 ): Promise<SlashCommand[]> {
   const result = await workspaceRequest(client, {
     type: 'discoverSlashCommands',
     provider,
     project_root: projectRoot,
+    binary_override: binaryOverride,
   })
   if (result.type !== 'slashCommands') {
     throw new Error('The daemon returned an unexpected slash-command response')

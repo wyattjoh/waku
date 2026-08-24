@@ -85,14 +85,26 @@ export function useComposerCommands(
   cwd: string | undefined,
 ) {
   const { client, config, phase } = useDaemon()
+  const settings = useDaemonSettings()
+  const binaryOverride = settings.data && provider
+    ? settings.data.provider_binary_overrides?.[provider] ?? null
+    : null
   return useQuery({
     queryKey: daemonKeys.slashCommands(
       config?.address ?? 'disconnected',
       provider ?? 'codex',
       cwd ?? 'none',
+      binaryOverride,
     ),
-    queryFn: () => discoverComposerCommands(requireClient(client), provider!, cwd!),
-    enabled: phase === 'connected' && Boolean(client && config && provider && cwd),
+    queryFn: () => discoverComposerCommands(
+      requireClient(client),
+      provider!,
+      cwd!,
+      binaryOverride,
+    ),
+    enabled: phase === 'connected' && Boolean(
+      client && config && provider && cwd && settings.data,
+    ),
     staleTime: Number.POSITIVE_INFINITY,
   })
 }

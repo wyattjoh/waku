@@ -1,9 +1,9 @@
 //! Process-neutral composer autocompletion and daemon-side discovery.
 //!
 //! Everything here is plain data work — trigger parsing over the composer's
-//! text, filesystem discovery of provider command files, fuzzy filtering — so
-//! the popup itself can stay a pure view. Discovery walks directories and forks
-//! `git`, which means it runs on the background executor only; the render path
+//! text, provider-owned command discovery, fuzzy filtering — so the popup
+//! itself can stay a pure view. Discovery walks directories and starts agent
+//! CLIs, which means it runs on the background executor only; the render path
 //! reads the cached results and nothing else.
 
 use std::collections::BTreeSet;
@@ -84,124 +84,71 @@ pub fn detect_trigger(text: &str, cursor: usize) -> Option<Trigger> {
 
 // ── Slash commands ─────────────────────────────────────────────────────────
 
-/// Where a command came from, in the order groups are listed.
-/// Waku's own built-ins. The shared commands are plain prompt templates Waku
-/// expands at submit, so they work over any transport — unlike a CLI's native
-/// built-ins, which only its own TUI understands. Provider-specific local
-/// commands such as Codex's `/fast` are handled by the client without starting
-/// a turn. A provider's native command of the same name is discovered first
-/// and wins the collision.
-fn builtin_waku_commands(provider: ProviderKind) -> Vec<SlashCommand> {
-    let instructions_file = match provider {
-        ProviderKind::Claude => "CLAUDE.md",
-        _ => "AGENTS.md",
-    };
-    let mut commands = [
-        (
-            "init",
-            tr!(
-                "commands.init_description",
-                instructions_file = instructions_file
-            ),
-            format!(
-                "Analyze this repository and write {instructions_file} for coding agents \
-                 working in it: build, test and lint commands, architecture overview, code \
-                 conventions, and any gotchas. If the file already exists, update it and \
-                 keep it concise."
-            ),
-        ),
-        (
-            "review",
-            tr!("commands.review_description"),
-            "Review the pending changes in this working tree: uncommitted work plus commits \
-             not on the default branch. Look for bugs, regressions, and risky patterns; \
-             report findings ordered by severity with file and line references."
-                .to_owned(),
-        ),
-        (
-            "commit",
-            tr!("commands.commit_description"),
-            "Look at the current working tree, stage the appropriate files, and create a git \
-             commit with a clear message that describes the change and why it was made."
-                .to_owned(),
-        ),
-    ]
-    .into_iter()
-    .map(|(name, description, template)| SlashCommand {
-        name: name.to_owned(),
-        description,
-        scope: CommandScope::Builtin,
-        argument_hint: None,
-        template: Some(template),
-    })
-    .collect::<Vec<_>>();
-    if provider == ProviderKind::Codex {
-        commands.push(SlashCommand {
-            name: "fast".to_owned(),
-            description: tr!("commands.fast_description"),
-            scope: CommandScope::Builtin,
-            argument_hint: None,
-            template: None,
-        });
-    }
-    commands
-}
-
-/// Claude Code built-ins worth surfacing from a frontend. The live session's
-/// init handshake later reports the authoritative list; this seeds the picker
-/// before any turn has started.
-fn builtin_claude_commands() -> Vec<SlashCommand> {
-    const BUILTINS: [(&str, &str); 6] = [
-        ("compact", "commands.claude_compact"),
-        ("context", "commands.claude_context"),
-        ("cost", "commands.claude_cost"),
-        ("init", "commands.claude_init"),
-        ("review", "commands.claude_review"),
-        ("security-review", "commands.claude_security_review"),
-    ];
-    BUILTINS
-        .into_iter()
-        .map(|(name, description_key)| SlashCommand {
-            name: name.to_owned(),
-            description: crate::i18n::translate(description_key),
-            scope: CommandScope::Builtin,
-            argument_hint: None,
-            template: None,
-        })
-        .collect()
-}
-
 /// Discover the slash commands available to `provider` inside `project_root`.
 ///
-/// Filesystem work throughout — background executor only. Sources follow each
-/// provider's own conventions:
+/// Filesystem and subprocess work throughout — background executor only. The
+/// installed CLI is authoritative for providers that expose a safe,
+/// sessionless catalog:
+///
+/// - Claude Code's SDK initialization control request reports built-ins,
+///   plugins, commands, skills, descriptions, and argument hints.
+/// - Codex app-server's `experimentalFeature/list` and `skills/list`, Amp's
+///   `skill list --json`, OpenCode's effective `debug config`, and Pi/Oh My
+///   Pi's RPC registries report the commands their non-TUI transports can
+///   actually invoke.
+/// - Cursor, Fx, Grok, Kimi Code, and Harness expose commands only after a real
+///   session exists, so their drivers merge the live registry instead of this
+///   function creating disposable provider sessions.
+///
+/// Filesystem discovery remains as graceful fallback metadata for configured
+/// commands and skills when a CLI is missing or an older version cannot report
+/// them. Sources follow each provider's conventions:
 ///
 /// - Claude Code: `.claude/commands` and `.claude/skills` in the project and
-///   the config dir (`$CLAUDE_CONFIG_DIR`, default `~/.claude`), plus curated
-///   built-ins. All passthrough: the CLI expands its own commands.
+///   the config dir (`$CLAUDE_CONFIG_DIR`, default `~/.claude`).
 /// - Codex: `~/.codex/prompts`, expanded by Waku at submit.
 /// - OpenCode: `.opencode/command` and `~/.config/opencode/command`, expanded
 ///   by Waku — its server transport takes plain prompt text.
 /// - Cursor: `.cursor/commands` in the project and home, expanded by Waku.
 /// - Pi: prompt templates in `.pi/prompts` and `~/.pi/agent/prompts`,
 ///   expanded by Waku, plus skills in `.pi/skills` and `~/.pi/agent/skills`.
+/// - Oh My Pi: the same layout under its own root — commands in
+///   `.omp/commands` and `~/.omp/agent/commands`, skills in `.omp/skills`
+///   and `~/.omp/agent/skills`.
 /// - Amp registers commands through TypeScript plugins and Grok publishes no
 ///   file convention, so neither has a native command scan; Amp's skills in
 ///   `~/.config/agents/skills` are listed.
 ///
 /// Skills — `SKILL.md` directories in each ecosystem's locations and the
 /// cross-tool `.agents/skills` / `~/.agents/skills` — are listed for every
-/// provider and always sent raw: `/skillname …` goes through verbatim and
-/// the provider's own skill machinery takes it from there.
+/// provider and always sent raw using its native invocation. Codex plugin
+/// skills retain the qualified `plugin:skill` catalog key so the client can
+/// translate its composer slash to `$plugin:skill` at the transport boundary.
+/// Pi and Oh My Pi skills retain their short name and resolve to
+/// `/skill:name` there.
 ///
-/// On top of the native sources, every provider reads Waku's own layer —
-/// `.waku/commands` in the project and `~/.config/waku/commands` — and gets
-/// Waku's built-ins ([`builtin_waku_commands`]), always expanded by Waku, so
-/// a template written once works over any transport. Native files scan
-/// first, so they win a same-scope name collision. Live processes may add
-/// more at runtime ([`merge_reported_commands`]): Claude's init handshake
-/// and ACP's `available_commands_update` for Cursor and Grok.
-pub fn discover_slash_commands(provider: ProviderKind, project_root: &Path) -> Vec<SlashCommand> {
+/// On top of provider sources, every provider reads Waku's user-defined layer
+/// (`.waku/commands` and `~/.config/waku/commands`).
+pub fn discover_slash_commands(
+    provider: ProviderKind,
+    project_root: &Path,
+    binary_override: Option<&str>,
+) -> Vec<SlashCommand> {
+    let cli_commands = match binary_override {
+        Some(binary) => crate::command_env::resolve_binary_override(binary),
+        None => crate::command_env::find_executable(provider.command()),
+    }
+    .as_deref()
+    .and_then(|binary| crate::slash_command_catalog::discover(provider, binary, project_root))
+    .unwrap_or_default();
+    assemble_slash_commands(provider, project_root, cli_commands)
+}
+
+fn assemble_slash_commands(
+    provider: ProviderKind,
+    project_root: &Path,
+    cli_commands: Vec<SlashCommand>,
+) -> Vec<SlashCommand> {
     let home = dirs::home_dir();
     let claude_config_dir = std::env::var("CLAUDE_CONFIG_DIR")
         .ok()
@@ -225,14 +172,17 @@ pub fn discover_slash_commands(provider: ProviderKind, project_root: &Path) -> V
                     &mut commands,
                 );
             }
-            scan_skill_files(&project_root.join(".claude/skills"), &mut commands);
+            scan_skill_files(
+                provider,
+                &project_root.join(".claude/skills"),
+                &mut commands,
+            );
             if let Some(config_dir) = claude_config_dir.as_deref() {
-                scan_skill_files(&config_dir.join("skills"), &mut commands);
+                scan_skill_files(provider, &config_dir.join("skills"), &mut commands);
             }
-            commands.extend(builtin_claude_commands());
         }
         ProviderKind::Codex => {
-            scan_skill_files(&project_root.join(".codex/skills"), &mut commands);
+            scan_skill_files(provider, &project_root.join(".codex/skills"), &mut commands);
             if let Some(home) = home.as_deref() {
                 scan_command_files(
                     &home.join(".codex/prompts"),
@@ -240,7 +190,7 @@ pub fn discover_slash_commands(provider: ProviderKind, project_root: &Path) -> V
                     true,
                     &mut commands,
                 );
-                scan_skill_files(&home.join(".codex/skills"), &mut commands);
+                scan_skill_files(provider, &home.join(".codex/skills"), &mut commands);
             }
         }
         ProviderKind::OpenCode => {
@@ -250,9 +200,17 @@ pub fn discover_slash_commands(provider: ProviderKind, project_root: &Path) -> V
                 true,
                 &mut commands,
             );
-            scan_skill_files(&project_root.join(".opencode/skills"), &mut commands);
+            scan_skill_files(
+                provider,
+                &project_root.join(".opencode/skills"),
+                &mut commands,
+            );
             // OpenCode also loads Claude-compatible skill trees.
-            scan_skill_files(&project_root.join(".claude/skills"), &mut commands);
+            scan_skill_files(
+                provider,
+                &project_root.join(".claude/skills"),
+                &mut commands,
+            );
             if let Some(home) = home.as_deref() {
                 scan_command_files(
                     &home.join(".config/opencode/command"),
@@ -260,8 +218,12 @@ pub fn discover_slash_commands(provider: ProviderKind, project_root: &Path) -> V
                     true,
                     &mut commands,
                 );
-                scan_skill_files(&home.join(".config/opencode/skills"), &mut commands);
-                scan_skill_files(&home.join(".claude/skills"), &mut commands);
+                scan_skill_files(
+                    provider,
+                    &home.join(".config/opencode/skills"),
+                    &mut commands,
+                );
+                scan_skill_files(provider, &home.join(".claude/skills"), &mut commands);
             }
         }
         ProviderKind::Cursor => {
@@ -271,7 +233,11 @@ pub fn discover_slash_commands(provider: ProviderKind, project_root: &Path) -> V
                 true,
                 &mut commands,
             );
-            scan_skill_files(&project_root.join(".cursor/skills"), &mut commands);
+            scan_skill_files(
+                provider,
+                &project_root.join(".cursor/skills"),
+                &mut commands,
+            );
             if let Some(home) = home.as_deref() {
                 scan_command_files(
                     &home.join(".cursor/commands"),
@@ -279,7 +245,31 @@ pub fn discover_slash_commands(provider: ProviderKind, project_root: &Path) -> V
                     true,
                     &mut commands,
                 );
-                scan_skill_files(&home.join(".cursor/skills"), &mut commands);
+                scan_skill_files(provider, &home.join(".cursor/skills"), &mut commands);
+            }
+        }
+        ProviderKind::Fx => {
+            // Fx discovers plain `skills/` plus compatibility roots from the
+            // workspace, and keeps managed installs under ~/.fx/skills.
+            for suffix in [
+                "skills",
+                ".opencode/skills",
+                ".codex/skills",
+                ".claude/skills",
+                ".claw/skills",
+            ] {
+                scan_skill_files(provider, &project_root.join(suffix), &mut commands);
+            }
+            if let Some(home) = home.as_deref() {
+                scan_skill_files(provider, &home.join(".fx/skills"), &mut commands);
+                scan_skill_files(
+                    provider,
+                    &home.join(".config/opencode/skills"),
+                    &mut commands,
+                );
+                scan_skill_files(provider, &home.join(".codex/skills"), &mut commands);
+                scan_skill_files(provider, &home.join(".claude/skills"), &mut commands);
+                scan_skill_files(provider, &home.join(".claw/skills"), &mut commands);
             }
         }
         ProviderKind::Pi => {
@@ -289,7 +279,7 @@ pub fn discover_slash_commands(provider: ProviderKind, project_root: &Path) -> V
                 true,
                 &mut commands,
             );
-            scan_skill_files(&project_root.join(".pi/skills"), &mut commands);
+            scan_skill_files(provider, &project_root.join(".pi/skills"), &mut commands);
             if let Some(home) = home.as_deref() {
                 scan_command_files(
                     &home.join(".pi/agent/prompts"),
@@ -297,22 +287,46 @@ pub fn discover_slash_commands(provider: ProviderKind, project_root: &Path) -> V
                     true,
                     &mut commands,
                 );
-                scan_skill_files(&home.join(".pi/agent/skills"), &mut commands);
+                scan_skill_files(provider, &home.join(".pi/agent/skills"), &mut commands);
+            }
+        }
+        ProviderKind::OhMyPi => {
+            scan_command_files(
+                &project_root.join(".omp/commands"),
+                CommandScope::Project,
+                true,
+                &mut commands,
+            );
+            scan_skill_files(provider, &project_root.join(".omp/skills"), &mut commands);
+            if let Some(home) = home.as_deref() {
+                scan_command_files(
+                    &home.join(".omp/agent/commands"),
+                    CommandScope::User,
+                    true,
+                    &mut commands,
+                );
+                scan_skill_files(provider, &home.join(".omp/agent/skills"), &mut commands);
             }
         }
         ProviderKind::Amp => {
             if let Some(home) = home.as_deref() {
-                scan_skill_files(&home.join(".config/agents/skills"), &mut commands);
+                scan_skill_files(provider, &home.join(".config/agents/skills"), &mut commands);
             }
         }
-        // Harness commands are session-scoped and reported live by the Host.
-        ProviderKind::DeepSeek | ProviderKind::Grok => {}
+        // Harness commands are session-scoped and reported live by the Host,
+        // and Kimi Code likewise publishes its whole command set over ACP
+        // rather than from files Waku could scan.
+        ProviderKind::DeepSeek | ProviderKind::Grok | ProviderKind::Kimi => {}
     }
     // The cross-tool skill standard, read by Amp and OpenCode among others;
     // Waku lists it for every provider.
-    scan_skill_files(&project_root.join(".agents/skills"), &mut commands);
+    scan_skill_files(
+        provider,
+        &project_root.join(".agents/skills"),
+        &mut commands,
+    );
     if let Some(home) = home.as_deref() {
-        scan_skill_files(&home.join(".agents/skills"), &mut commands);
+        scan_skill_files(provider, &home.join(".agents/skills"), &mut commands);
     }
     scan_command_files(
         &project_root.join(".waku/commands"),
@@ -328,7 +342,7 @@ pub fn discover_slash_commands(provider: ProviderKind, project_root: &Path) -> V
             &mut commands,
         );
     }
-    commands.extend(builtin_waku_commands(provider));
+    commands.extend(cli_commands);
     dedup_and_sort_commands(commands)
 }
 
@@ -449,10 +463,10 @@ fn scan_command_files(
     }
 }
 
-/// Collect skills — one directory per skill with a `SKILL.md` — as slash
-/// commands. Always passthrough: the typed `/skillname …` goes to the
-/// provider verbatim, and its own skill machinery takes it from there.
-fn scan_skill_files(root: &Path, commands: &mut Vec<SlashCommand>) {
+/// Collect skills — one directory per skill with a `SKILL.md` — as provider
+/// commands. Always passthrough: the provider-native invocation goes through
+/// verbatim, and its own skill machinery resolves it.
+fn scan_skill_files(provider: ProviderKind, root: &Path, commands: &mut Vec<SlashCommand>) {
     let Ok(entries) = std::fs::read_dir(root) else {
         return;
     };
@@ -474,14 +488,50 @@ fn scan_skill_files(root: &Path, commands: &mut Vec<SlashCommand>) {
             continue;
         };
         let front = parse_frontmatter(&contents);
+        let short_name = front.name.unwrap_or(dir_name);
+        let plugin_name = (provider == ProviderKind::Codex)
+            .then(|| codex_plugin_name(&entry.path()))
+            .flatten();
+        let name = match plugin_name.as_deref() {
+            Some(plugin_name) if !short_name.contains(':') => {
+                format!("{plugin_name}:{short_name}")
+            }
+            _ => short_name,
+        };
         commands.push(SlashCommand {
-            name: front.name.unwrap_or(dir_name),
+            name,
             description: front.description.unwrap_or_default(),
             scope: CommandScope::Skill,
             argument_hint: None,
             template: None,
         });
     }
+}
+
+/// Resolve Codex's plugin namespace from the nearest plugin manifest above a
+/// skill's canonical directory. Installed skills are commonly symlinked from
+/// a presence directory into the plugin checkout, so inspecting only the link
+/// location loses the catalog key Codex requires for explicit invocation.
+fn codex_plugin_name(skill_dir: &Path) -> Option<String> {
+    let canonical = std::fs::canonicalize(skill_dir).ok()?;
+    for ancestor in canonical.ancestors().take(WALK_MAX_DEPTH + 1) {
+        for relative_manifest in [".codex-plugin/plugin.json", ".claude-plugin/plugin.json"] {
+            let Ok(contents) = std::fs::read_to_string(ancestor.join(relative_manifest)) else {
+                continue;
+            };
+            let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&contents) else {
+                continue;
+            };
+            let Some(name) = manifest.get("name").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            let name = name.trim();
+            if !name.is_empty() {
+                return Some(name.to_owned());
+            }
+        }
+    }
+    None
 }
 
 struct Frontmatter<'a> {
@@ -491,9 +541,9 @@ struct Frontmatter<'a> {
     body: &'a str,
 }
 
-/// Pull the few keys the picker shows out of a leading YAML block, without a
-/// YAML parser: command files only use flat `key: value` lines in practice,
-/// and an unparsed extra key must not cost the command its listing.
+/// Pull the few keys the picker shows out of a leading YAML block. The shared
+/// frontmatter reader understands simple scalar values and block strings, and
+/// skips unsupported lines so an extra key never costs the command its listing.
 fn parse_frontmatter(contents: &str) -> Frontmatter<'_> {
     let mut front = Frontmatter {
         name: None,
@@ -501,28 +551,12 @@ fn parse_frontmatter(contents: &str) -> Frontmatter<'_> {
         argument_hint: None,
         body: contents,
     };
-    let Some(rest) = contents.strip_prefix("---") else {
-        return front;
-    };
-    let Some((block, body)) = rest.split_once("\n---") else {
-        return front;
-    };
-    front.body = body.trim_start_matches(['-']).trim_start();
-    for line in block.lines() {
-        let Some((key, value)) = line.split_once(':') else {
-            continue;
-        };
-        let value = value.trim().trim_matches('"').trim_matches('\'');
-        if value.is_empty() {
-            continue;
-        }
-        match key.trim() {
-            "name" => front.name = Some(value.to_owned()),
-            "description" => front.description = Some(value.to_owned()),
-            "argument-hint" => front.argument_hint = Some(value.to_owned()),
-            _ => {}
-        }
-    }
+    front.body = crate::frontmatter::parse_frontmatter_fields(contents, |key, value| match key {
+        "name" => front.name = Some(value),
+        "description" => front.description = Some(value),
+        "argument-hint" => front.argument_hint = Some(value),
+        _ => {}
+    });
     front
 }
 
@@ -593,23 +627,55 @@ pub fn expand_command_template(template: &str, args: &str) -> String {
 
 /// The prompt to hand the driver for what the user typed.
 ///
-/// `Some` only when the prompt invokes a known template command — the
-/// transcript keeps the typed `/name …` either way, mirroring how the CLIs
-/// echo the invocation rather than the expansion. Passthrough commands and
-/// unknown `/words` go to the provider untouched.
-pub fn expanded_submission(prompt: &str, commands: &[SlashCommand]) -> Option<String> {
+/// `Some` only when transport text differs from the transcript: known
+/// templates expand, and Codex skill slashes become dollar-prefixed catalog
+/// keys. Other passthrough commands and unknown `/words` stay untouched.
+pub fn resolved_submission(
+    provider: ProviderKind,
+    prompt: &str,
+    commands: &[SlashCommand],
+) -> Option<String> {
+    if let Some(skill) = resolved_skill_submission(provider, prompt, commands) {
+        return Some(skill);
+    }
     let invocation = prompt.strip_prefix('/')?;
     let (name, args) = match invocation.split_once(char::is_whitespace) {
         Some((name, args)) => (name, args.trim()),
         None => (invocation, ""),
     };
-    let command = commands
+    let command = commands.iter().find(|command| command.name == name)?;
+    let template = command.template.as_deref()?;
+    Some(expand_command_template(template, args))
+}
+
+/// Resolve only provider-native skill syntax, without expanding templates.
+pub fn resolved_skill_submission(
+    provider: ProviderKind,
+    prompt: &str,
+    commands: &[SlashCommand],
+) -> Option<String> {
+    if !matches!(
+        provider,
+        ProviderKind::Codex | ProviderKind::Fx | ProviderKind::Pi | ProviderKind::OhMyPi
+    ) {
+        return None;
+    }
+    let invocation = prompt.strip_prefix('/')?;
+    let name = match invocation.split_once(char::is_whitespace) {
+        Some((name, _)) => name,
+        None => invocation,
+    };
+    if !commands
         .iter()
-        .find(|command| command.name == name && command.template.is_some())?;
-    Some(expand_command_template(
-        command.template.as_deref().unwrap_or_default(),
-        args,
-    ))
+        .any(|command| command.name == name && command.scope == CommandScope::Skill)
+    {
+        return None;
+    }
+    Some(match provider {
+        ProviderKind::Codex | ProviderKind::Fx => format!("${invocation}"),
+        ProviderKind::Pi | ProviderKind::OhMyPi => format!("/skill:{invocation}"),
+        _ => unreachable!("non-native skill providers returned above"),
+    })
 }
 
 // ── Workspace file index ───────────────────────────────────────────────────
@@ -653,7 +719,7 @@ pub fn list_project_files(root: &Path, cap: usize) -> Vec<FileEntry> {
 }
 
 fn git_listed_files(root: &Path, cap: usize) -> Option<Vec<String>> {
-    let output = std::process::Command::new("git")
+    let output = crate::command_env::plain_command("git")
         .arg("-C")
         .arg(root)
         .args([
@@ -897,6 +963,23 @@ mod tests {
         assert_eq!(front.argument_hint.as_deref(), Some("[pr-number]"));
         assert_eq!(front.body, "Review PR $1.");
 
+        let folded = parse_frontmatter(
+            "---\ndescription: >-\n  Run the review\n  across changed files.\nargument-hint: [pr-number]\n---\nReview PR $1.",
+        );
+        assert_eq!(
+            folded.description.as_deref(),
+            Some("Run the review across changed files.")
+        );
+        assert_eq!(folded.argument_hint.as_deref(), Some("[pr-number]"));
+
+        let indented = parse_frontmatter(
+            "---\ndescription: >-\n  Run:\n    cargo test\n  before merging.\n---\nBody",
+        );
+        assert_eq!(
+            indented.description.as_deref(),
+            Some("Run:\n  cargo test\nbefore merging.")
+        );
+
         let plain = parse_frontmatter("Just a prompt body.");
         assert!(plain.description.is_none());
         assert_eq!(plain.body, "Just a prompt body.");
@@ -955,14 +1038,39 @@ mod tests {
                 argument_hint: None,
                 template: None,
             },
+            SlashCommand {
+                name: "mattpocock-skills:to-spec".into(),
+                description: String::new(),
+                scope: CommandScope::Skill,
+                argument_hint: None,
+                template: None,
+            },
         ];
         assert_eq!(
-            expanded_submission("/fix the tests", &commands).as_deref(),
+            resolved_submission(ProviderKind::OpenCode, "/fix the tests", &commands).as_deref(),
             Some("Fix the tests carefully.")
         );
-        assert_eq!(expanded_submission("/compact", &commands), None);
-        assert_eq!(expanded_submission("/unknown thing", &commands), None);
-        assert_eq!(expanded_submission("plain prompt", &commands), None);
+        assert_eq!(
+            resolved_submission(ProviderKind::OpenCode, "/compact", &commands),
+            None
+        );
+        assert_eq!(
+            resolved_submission(ProviderKind::OpenCode, "/unknown thing", &commands),
+            None
+        );
+        assert_eq!(
+            resolved_submission(ProviderKind::OpenCode, "plain prompt", &commands),
+            None
+        );
+        assert_eq!(
+            resolved_submission(
+                ProviderKind::Codex,
+                "/mattpocock-skills:to-spec carefully",
+                &commands
+            )
+            .as_deref(),
+            Some("$mattpocock-skills:to-spec carefully")
+        );
     }
 
     #[test]
@@ -1131,7 +1239,13 @@ mod tests {
 
     #[test]
     fn command_filter_matches_names() {
-        let commands = builtin_claude_commands();
+        let commands = vec![SlashCommand {
+            name: "security-review".into(),
+            description: "Review security".into(),
+            scope: CommandScope::Builtin,
+            argument_hint: None,
+            template: None,
+        }];
         let mut matcher = matcher();
         let matched = filter_commands(&commands, "sec", &mut matcher);
         assert_eq!(matched[0].item.name, "security-review");
@@ -1161,64 +1275,28 @@ mod tests {
     }
 
     #[test]
-    fn every_provider_offers_slash_commands_out_of_the_box() {
-        let root = std::env::temp_dir().join(format!("waku-empty-{}", std::process::id()));
+    fn provider_cli_catalog_entries_join_the_composer_index() {
+        let root = std::env::temp_dir().join(format!("waku-cli-catalog-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
-        for provider in ProviderKind::ALL {
-            let commands = discover_slash_commands(provider, &root);
-            for expected in ["init", "review", "commit"] {
-                let command = commands
-                    .iter()
-                    .find(|command| command.name == expected)
-                    .unwrap_or_else(|| {
-                        panic!("{} is missing /{expected}", provider.display_name())
-                    });
-                // Claude's own /init and /review pass through to the CLI;
-                // everywhere else Waku expands its template.
-                if provider != ProviderKind::Claude {
-                    assert!(
-                        command.template.is_some(),
-                        "{} /{expected} must be a Waku template",
-                        provider.display_name()
-                    );
-                }
-            }
-        }
-        // The instructions file matches each ecosystem's convention.
-        let claude = discover_slash_commands(ProviderKind::Claude, &root);
-        let amp = discover_slash_commands(ProviderKind::Amp, &root);
-        assert!(
-            claude
-                .iter()
-                .any(|c| c.name == "commit" && c.template.is_some())
+        let commands = assemble_slash_commands(
+            ProviderKind::Claude,
+            &root,
+            vec![SlashCommand {
+                name: "waku-test-dynamic-command".into(),
+                description: "Reported by the CLI".into(),
+                scope: CommandScope::Builtin,
+                argument_hint: Some("[target]".into()),
+                template: None,
+            }],
         );
-        assert!(amp.iter().find(|c| c.name == "init").is_some_and(|c| {
-            c.template
-                .as_deref()
-                .unwrap_or_default()
-                .contains("AGENTS.md")
-        }));
+        let command = commands
+            .iter()
+            .find(|command| command.name == "waku-test-dynamic-command")
+            .expect("CLI command must join the index");
+        assert_eq!(command.description, "Reported by the CLI");
+        assert_eq!(command.argument_hint.as_deref(), Some("[target]"));
         let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn fast_builtin_is_codex_only() {
-        for provider in ProviderKind::ALL {
-            let commands = builtin_waku_commands(provider);
-            let fast = commands.iter().find(|command| command.name == "fast");
-            if provider == ProviderKind::Codex {
-                let fast = fast.expect("Codex is missing /fast");
-                assert_eq!(fast.scope, CommandScope::Builtin);
-                assert!(fast.template.is_none());
-            } else {
-                assert!(
-                    fast.is_none(),
-                    "{} unexpectedly offers /fast",
-                    provider.display_name()
-                );
-            }
-        }
     }
 
     #[test]
@@ -1232,7 +1310,7 @@ mod tests {
         )
         .unwrap();
         for provider in ProviderKind::ALL {
-            let commands = discover_slash_commands(provider, &root);
+            let commands = assemble_slash_commands(provider, &root, Vec::new());
             let skill = commands
                 .iter()
                 .find(|command| command.name == "deploy-runbook")
@@ -1244,18 +1322,33 @@ mod tests {
             );
         }
         // Raw passthrough end to end: no expansion applies at submit.
-        let commands = discover_slash_commands(ProviderKind::Amp, &root);
+        let commands = assemble_slash_commands(ProviderKind::Amp, &root, Vec::new());
         assert_eq!(
-            expanded_submission("/deploy-runbook staging", &commands),
+            resolved_submission(ProviderKind::Amp, "/deploy-runbook staging", &commands),
             None
+        );
+        assert_eq!(
+            resolved_submission(ProviderKind::Pi, "/deploy-runbook staging", &commands).as_deref(),
+            Some("/skill:deploy-runbook staging")
+        );
+        assert_eq!(
+            resolved_submission(ProviderKind::OhMyPi, "/deploy-runbook staging", &commands)
+                .as_deref(),
+            Some("/skill:deploy-runbook staging")
+        );
+        assert_eq!(
+            resolved_submission(ProviderKind::Fx, "/deploy-runbook staging", &commands).as_deref(),
+            Some("$deploy-runbook staging")
         );
 
         // Each ecosystem's own project-level skill tree is read too.
         for (provider, dir) in [
             (ProviderKind::Codex, ".codex/skills"),
             (ProviderKind::Cursor, ".cursor/skills"),
+            (ProviderKind::Fx, "skills"),
             (ProviderKind::OpenCode, ".opencode/skills"),
             (ProviderKind::Pi, ".pi/skills"),
+            (ProviderKind::OhMyPi, ".omp/skills"),
         ] {
             let skill_dir = root.join(dir).join("native-skill");
             std::fs::create_dir_all(&skill_dir).unwrap();
@@ -1265,7 +1358,7 @@ mod tests {
             )
             .unwrap();
             assert!(
-                discover_slash_commands(provider, &root)
+                assemble_slash_commands(provider, &root, Vec::new())
                     .iter()
                     .any(|command| command.name == "native-skill"),
                 "{} misses its project skill tree",
@@ -1276,6 +1369,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    // Windows gates symlink creation behind Developer Mode.
+    #[cfg(unix)]
     #[test]
     fn symlinked_skills_and_command_dirs_are_discovered() {
         let root = std::env::temp_dir().join(format!("waku-symlink-{}", std::process::id()));
@@ -1296,7 +1391,7 @@ mod tests {
         std::os::unix::fs::symlink(root.join("real/commands"), root.join("commands")).unwrap();
 
         let mut commands = Vec::new();
-        scan_skill_files(&root.join("skills"), &mut commands);
+        scan_skill_files(ProviderKind::Claude, &root.join("skills"), &mut commands);
         assert!(
             commands.iter().any(|c| c.name == "my-skill"),
             "symlinked skill missing: {commands:?}"
@@ -1310,6 +1405,47 @@ mod tests {
         assert!(
             commands.iter().any(|c| c.name == "deploy"),
             "commands under a symlinked root missing: {commands:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Windows gates symlink creation behind Developer Mode.
+    #[cfg(unix)]
+    #[test]
+    fn codex_plugin_skill_uses_qualified_catalog_key() {
+        let root =
+            std::env::temp_dir().join(format!("waku-codex-plugin-skill-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let plugin = root.join("plugin");
+        let skill = plugin.join("skills/to-spec");
+        std::fs::create_dir_all(plugin.join(".claude-plugin")).unwrap();
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(
+            plugin.join(".claude-plugin/plugin.json"),
+            r#"{"name":"mattpocock-skills","skills":["./skills/to-spec"]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: to-spec\ndescription: Turn this into a spec\n---\nBody",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join(".agents/skills")).unwrap();
+        std::os::unix::fs::symlink(&skill, root.join(".agents/skills/to-spec")).unwrap();
+
+        let commands = assemble_slash_commands(ProviderKind::Codex, &root, Vec::new());
+        assert!(
+            commands
+                .iter()
+                .any(|command| command.name == "mattpocock-skills:to-spec"),
+            "Codex plugin skill is missing its catalog key: {commands:?}"
+        );
+        let claude_commands = assemble_slash_commands(ProviderKind::Claude, &root, Vec::new());
+        assert!(
+            claude_commands
+                .iter()
+                .any(|command| command.name == "to-spec"),
+            "non-Codex providers must preserve the skill's native short name"
         );
         let _ = std::fs::remove_dir_all(&root);
     }

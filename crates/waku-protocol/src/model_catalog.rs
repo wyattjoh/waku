@@ -49,14 +49,22 @@ pub fn fallback_models(provider: ProviderKind) -> Vec<ProviderModel> {
             claude_reasoning_model("claude-opus-4-5", "Claude Opus 4.5"),
             claude_long_context(claude_ultracode_model("claude-sonnet-5", "Claude Sonnet 5"))
                 .default(),
-            claude_long_context(claude_reasoning_model("claude-sonnet-4-6", "Claude Sonnet 4.6")),
+            claude_long_context(claude_reasoning_model(
+                "claude-sonnet-4-6",
+                "Claude Sonnet 4.6",
+            )),
             ProviderModel::new("claude-haiku-4-5", "Claude Haiku 4.5"),
         ],
         ProviderKind::Cursor => {
             vec![ProviderModel::new("auto", tr!("model_option.auto")).default()]
         }
-        ProviderKind::DeepSeek | ProviderKind::OpenCode | ProviderKind::Pi => Vec::new(),
-        ProviderKind::Grok => vec![ProviderModel::new("grok-build", "Grok Build").default()],
+        ProviderKind::DeepSeek
+        | ProviderKind::Fx
+        | ProviderKind::Grok
+        | ProviderKind::Kimi
+        | ProviderKind::OpenCode
+        | ProviderKind::OhMyPi
+        | ProviderKind::Pi => Vec::new(),
     }
 }
 
@@ -99,6 +107,17 @@ fn reasoning_options<const N: usize>(efforts: [&str; N]) -> Vec<ProviderModelOpt
         .collect()
 }
 
+/// The exact Grok models the hardcoded reasoning menu is known to cover.
+/// `grok models` also lists user-defined custom models, whose effort support
+/// is not knowable from the ID, so they get no menu.
+pub fn grok_model_reasoning_efforts(id: &str) -> Option<&'static [&'static str]> {
+    match id.to_ascii_lowercase().as_str() {
+        "grok-4.5" => Some(&["low", "medium", "high"]),
+        "grok-4.6" => Some(&["low", "medium", "high", "xhigh"]),
+        _ => None,
+    }
+}
+
 fn claude_reasoning_model(id: &str, name: &str) -> ProviderModel {
     ProviderModel::new(id, name).reasoning(
         reasoning_options(["low", "medium", "high", "xhigh", "max"]),
@@ -126,4 +145,32 @@ fn claude_long_context(model: ProviderModel) -> ProviderModel {
         ],
         "200k",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn grok_reasoning_menu_covers_only_exact_builtins() {
+        assert_eq!(
+            grok_model_reasoning_efforts("grok-4.5"),
+            Some(&["low", "medium", "high"][..])
+        );
+        assert_eq!(
+            grok_model_reasoning_efforts("grok-4.6"),
+            Some(&["low", "medium", "high", "xhigh"][..])
+        );
+        // Custom models and unknown spellings get no menu.
+        assert_eq!(grok_model_reasoning_efforts("grok-build"), None);
+        assert_eq!(grok_model_reasoning_efforts("my-custom-test"), None);
+        assert_eq!(grok_model_reasoning_efforts("grok-4-6"), None);
+    }
+
+    #[test]
+    fn grok_fallback_catalog_is_empty() {
+        // A fabricated fallback would offer a model the CLI rejects, so
+        // discovery is authoritative and the pre-discovery picker is empty.
+        assert!(fallback_models(ProviderKind::Grok).is_empty());
+    }
 }

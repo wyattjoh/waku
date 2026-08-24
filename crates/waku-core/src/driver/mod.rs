@@ -19,8 +19,8 @@ use crossbeam_channel::{Receiver, SendError, Sender, unbounded};
 
 use crate::computer_use::ComputerToolRequest;
 use crate::model::{
-    BackgroundWorkKey, DriverEvent, InteractionMode, ProviderKind, ProviderResumeCursor,
-    RuntimeMode, UserInputAnswer,
+    BackgroundWorkKey, DriverEvent, GoalOperation, InteractionMode, ProviderKind,
+    ProviderResumeCursor, RuntimeMode, UserInputAnswer,
 };
 
 /// Provider events remain synchronous to send from reader threads, while the
@@ -119,6 +119,12 @@ impl DriverHandle {
         self.inner.respond_user_input(request_id, answers);
     }
 
+    /// Read or mutate the provider-persisted thread goal. Outcomes arrive
+    /// asynchronously as `DriverEvent::GoalUpdated` or `DriverEvent::Error`.
+    pub fn goal(&self, operation: GoalOperation) {
+        self.inner.goal(operation);
+    }
+
     pub fn run_computer_tool(&self, request: ComputerToolRequest) {
         self.inner.run_computer_tool(request);
     }
@@ -155,6 +161,9 @@ pub trait DriverControl: Send + Sync {
     fn stop_background_work(&self, _key: BackgroundWorkKey, _control_id: String) {}
     fn respond(&self, request_id: String, option_id: String);
     fn respond_user_input(&self, _request_id: String, _answers: Vec<UserInputAnswer>) {}
+    /// Providers without persisted goals ignore the request; the UI only
+    /// offers goal controls where the provider reports one.
+    fn goal(&self, _operation: GoalOperation) {}
     fn run_computer_tool(&self, _request: ComputerToolRequest) {}
     fn reject_computer_tool(&self, _request: ComputerToolRequest, _reason: String) {}
     /// Applies changed turn options to the live session, returning whether the
@@ -203,11 +212,14 @@ pub(crate) fn start_local(
 ) -> anyhow::Result<DriverHandle> {
     let inner: Arc<dyn DriverControl> = match provider {
         ProviderKind::Codex => Arc::new(codex::CodexDriver::start(options, events)?),
-        ProviderKind::Pi => Arc::new(pi::PiDriver::start(options, events)?),
-        // Cursor and Grok both serve a long-lived ACP session, which is the only
-        // way their Supervised mode can actually ask the user rather than
-        // silently forcing or denying.
-        ProviderKind::Cursor | ProviderKind::Grok => {
+        ProviderKind::Pi => Arc::new(pi::PiDriver::start(pi::PiFlavor::Pi, options, events)?),
+        ProviderKind::OhMyPi => {
+            Arc::new(pi::PiDriver::start(pi::PiFlavor::OhMyPi, options, events)?)
+        }
+        // Cursor, Fx, Grok, and Kimi Code all serve a long-lived ACP session,
+        // which is the only way their Supervised mode can actually ask the user
+        // rather than silently forcing or denying.
+        ProviderKind::Cursor | ProviderKind::Fx | ProviderKind::Grok | ProviderKind::Kimi => {
             Arc::new(acp::AcpDriver::start(provider, options, events)?)
         }
         ProviderKind::DeepSeek => Arc::new(deepseek::DeepSeekDriver::start(options, events)?),

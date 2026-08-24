@@ -1,8 +1,14 @@
 use super::*;
 
 fn should_render_empty_state(session: Option<&AgentSession>) -> bool {
+    // Turns count as content even before any message exists: a
+    // provider-initiated turn (Codex goal continuation) reasons for a while
+    // before its first text delta, and the transcript's working indicator —
+    // not the new-task greeting — is what represents that state.
     session
-        .map(|session| session.detail_loaded && session.messages.is_empty())
+        .map(|session| {
+            session.detail_loaded && session.messages.is_empty() && session.turns.is_empty()
+        })
         .unwrap_or(true)
 }
 
@@ -60,21 +66,105 @@ impl Waku {
     }
 }
 
+/// Panel geometry for the frame being built.
+#[derive(Clone, Copy)]
+struct PanelFrame {
+    /// Width each panel lays its content out at, sliding or not.
+    sidebar_content: f32,
+    right_panel_content: f32,
+    /// Width each panel occupies on screen: the eased slide while one runs.
+    sidebar: f32,
+    right_panel: f32,
+    /// Which edge is mid-slide. The clip that keeps a sliding panel inside its
+    /// narrowing container also cuts whatever that panel draws outside its own
+    /// bounds — the right panel's resize handle sits entirely left of its edge
+    /// — so each clip only goes on while its own panel is actually moving.
+    sidebar_sliding: bool,
+    right_panel_sliding: bool,
+    /// An edge is still moving, so the frame loop has to keep going.
+    sliding: bool,
+}
+
+/// Advance one panel's slide: the eased width while it runs, the settled
+/// target once it is over. Retiring the tween here is what lets a closed
+/// panel leave the element tree instead of lingering at zero width, still
+/// rebuilding itself on every notify.
+fn slide_width(slide: &mut Option<motion::WidthTween>, target: f32) -> f32 {
+    match slide.and_then(|slide| slide.width_toward(target)) {
+        Some(width) => width,
+        None => {
+            *slide = None;
+            target
+        }
+    }
+}
+
 impl Waku {
-    /// Width left for the chat column once the visible panels take theirs.
+    /// An edge is currently animating. While this holds, the pane islands'
+    /// root observer stops fanning root notifies out to every island (see
+    /// [`WakuPane::bind`]) and lets the cached-view geometry checks decide
+    /// which islands a slide tick actually rebuilds.
+    pub(super) fn panels_sliding(&self) -> bool {
+        self.sidebar_slide.is_some() || self.right_panel_slide.is_some()
+    }
+
+    /// Settle both panel slides for this frame and publish the widths the
+    /// pane islands — which render later, during layout — have to agree with.
+    fn settle_panel_slides(&mut self, window: &Window) -> PanelFrame {
+        let was_sliding = self.panels_sliding();
+        if self.settings_page.is_some() {
+            // Settings covers the workspace, so there is no edge on screen to
+            // move. Retire the slide rather than animate a layout nobody can
+            // see; reopening the workspace finds the panels where they belong.
+            self.sidebar_slide = None;
+            self.right_panel_slide = None;
+        }
+        let (sidebar_content, right_panel_content) = self.effective_panel_widths(window);
+        let sidebar = slide_width(
+            &mut self.sidebar_slide,
+            if self.sidebar_visible {
+                sidebar_content
+            } else {
+                0.0
+            },
+        );
+        let right_panel = slide_width(
+            &mut self.right_panel_slide,
+            if self.right_panel_visible {
+                right_panel_content
+            } else {
+                0.0
+            },
+        );
+        self.sidebar_rendered_width = sidebar;
+        self.right_panel_rendered_width = right_panel;
+        let sliding = self.panels_sliding();
+        if was_sliding && !sliding {
+            // The observer gate held root-state fan-out away from any island
+            // the slide left geometry-stable. One ungated notify now that
+            // the slide is over rebuilds every island once, so whatever
+            // root state changed during those 200ms lands the next frame.
+            let root = window.current_view();
+            window.on_next_frame(move |_, cx| cx.notify(root));
+        }
+        PanelFrame {
+            sidebar_content,
+            right_panel_content,
+            sidebar,
+            right_panel,
+            sidebar_sliding: self.sidebar_slide.is_some(),
+            right_panel_sliding: self.right_panel_slide.is_some(),
+            sliding,
+        }
+    }
+
+    /// Width left for the chat column once the panels take theirs — the
+    /// widths they are painted at this frame, so a transcript measured
+    /// mid-slide matches the column it is laid out in.
     fn chat_viewport_width(&self, window: &Window) -> f32 {
-        let (sidebar_width, right_panel_width) = self.effective_panel_widths(window);
         f32::from(window.viewport_size().width)
-            - if self.sidebar_visible {
-                sidebar_width
-            } else {
-                0.0
-            }
-            - if self.right_panel_visible {
-                right_panel_width
-            } else {
-                0.0
-            }
+            - self.sidebar_rendered_width
+            - self.right_panel_rendered_width
     }
 
     /// [`WakuPane`] delegate for the sidebar island.
@@ -135,6 +225,15 @@ impl Waku {
 
 impl Render for Waku {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Panel geometry first: the browser sync right below reads whether a
+        // panel is mid-slide, and settling here rather than at the point of
+        // use keeps the pane islands and the transcript on one set of widths.
+        let panels = self.settle_panel_slides(window);
+        if panels.sliding {
+            // The manual drive for the width tweens — the same scheduling
+            // `with_animation` would do, minus its element-id keying.
+            window.request_animation_frame();
+        }
         // Before anything can early-return (the settings page below), settle
         // whether each native browser webview belongs on screen this frame —
         // it floats above everything GPUI paints.
@@ -143,19 +242,30 @@ impl Render for Waku {
             self.tick_fps(window);
         }
         let image_preview = self.render_image_preview(cx);
+        let task_switcher = self.render_task_switcher(window, cx);
         if self.settings_page.is_some() {
             let command_palette = self.render_command_palette(window, cx);
             let commit_dialog = self.render_commit_dialog(cx);
+            let goal_dialog = self.render_goal_dialog(window, cx);
             let toast = self.render_active_toast(cx);
             let content = div()
                 .relative()
                 .size_full()
                 .on_action(cx.listener(Self::toggle_command_palette_action))
+                .on_action(cx.listener(Self::switch_task_forward_action))
+                .on_action(cx.listener(Self::switch_task_backward_action))
+                .on_action(cx.listener(Self::select_first_task_action))
+                .on_action(cx.listener(Self::select_last_task_action))
+                .on_action(cx.listener(Self::confirm_task_switch_action))
+                .on_action(cx.listener(Self::cancel_task_switch_action))
+                .on_modifiers_changed(cx.listener(Self::task_switcher_modifiers_changed))
                 .child(self.render_settings(window, cx))
                 .children(toast)
                 .children(command_palette)
                 .children(commit_dialog)
+                .children(goal_dialog)
                 .children(image_preview)
+                .children(task_switcher)
                 .into_any_element();
             return self.render_window_frame(content, window, cx);
         }
@@ -169,8 +279,8 @@ impl Render for Waku {
         let computer_use = self.render_computer_use_overlay(cx);
         let command_palette = self.render_command_palette(window, cx);
         let commit_dialog = self.render_commit_dialog(cx);
+        let goal_dialog = self.render_goal_dialog(window, cx);
         let toast = self.render_active_toast(cx);
-        let (sidebar_width, right_panel_width) = self.effective_panel_widths(window);
         let content = div()
             .key_context("Waku")
             .on_action(cx.listener(Self::close_window_or_right_panel_tab_action))
@@ -183,6 +293,12 @@ impl Render for Waku {
             .on_action(cx.listener(Self::toggle_fps_counter_action))
             .on_action(cx.listener(Self::navigate_back_action))
             .on_action(cx.listener(Self::navigate_forward_action))
+            .on_action(cx.listener(Self::switch_task_forward_action))
+            .on_action(cx.listener(Self::switch_task_backward_action))
+            .on_action(cx.listener(Self::select_first_task_action))
+            .on_action(cx.listener(Self::select_last_task_action))
+            .on_action(cx.listener(Self::confirm_task_switch_action))
+            .on_action(cx.listener(Self::cancel_task_switch_action))
             .on_action(cx.listener(Self::focus_composer_action))
             .on_action(cx.listener(Self::toggle_model_picker_action))
             .on_action(cx.listener(Self::toggle_usage_panel_action))
@@ -198,6 +314,7 @@ impl Render for Waku {
             .on_action(cx.listener(Self::toggle_find_whole_word_action))
             .on_action(cx.listener(Self::toggle_find_regex_action))
             .on_action(cx.listener(Self::replace_all_matches_action))
+            .on_modifiers_changed(cx.listener(Self::task_switcher_modifiers_changed))
             .capture_any_mouse_down(cx.listener(Self::navigation_mouse_down))
             .on_mouse_move(cx.listener(Self::resize_panel_mouse_move))
             .capture_any_mouse_up(cx.listener(Self::finish_panel_resize))
@@ -206,13 +323,26 @@ impl Render for Waku {
             .flex()
             .text_color(theme.text)
             .font_family(".SystemUIFont")
-            .when(self.sidebar_visible, |root| {
-                root.child(self.sidebar_pane.clone().cached(
-                    StyleRefinement::default()
-                        .w(px(sidebar_width))
+            // Both panels slide through a container that narrows while their
+            // content keeps its full width and is clipped: the sidebar list
+            // and the right panel's surfaces never reflow on the way in or
+            // out, and their bounds stay put so only the clip moves.
+            .when(panels.sidebar > 0.0, |root| {
+                root.child(
+                    div()
                         .h_full()
-                        .flex_none(),
-                ))
+                        .flex_none()
+                        .w(px(panels.sidebar))
+                        .when(panels.sidebar_sliding, |element| element.overflow_hidden())
+                        .child(
+                            self.sidebar_pane.clone().cached(
+                                StyleRefinement::default()
+                                    .w(px(panels.sidebar_content))
+                                    .h_full()
+                                    .flex_none(),
+                            ),
+                        ),
+                )
             })
             .child(
                 div()
@@ -222,7 +352,7 @@ impl Render for Waku {
                     .flex()
                     .flex_col()
                     .bg(theme.surface)
-                    .when(self.sidebar_visible, |element| {
+                    .when(panels.sidebar > 0.0, |element| {
                         element.border_l_1().border_color(theme.sidebar_border)
                     })
                     .child(self.render_header(window, cx))
@@ -231,9 +361,7 @@ impl Render for Waku {
                     } else {
                         self.transcript_pane
                             .clone()
-                            .cached(
-                                StyleRefinement::default().flex_1().min_h(px(0.0)).w_full(),
-                            )
+                            .cached(StyleRefinement::default().flex_1().min_h(px(0.0)).w_full())
                             .into_any_element()
                     })
                     .children(permission)
@@ -254,17 +382,37 @@ impl Render for Waku {
                         ))
                     }),
             )
-            .when(self.right_panel_visible, |root| {
-                root.child(self.right_panel_pane.clone().cached(
-                    StyleRefinement::default()
-                        .w(px(right_panel_width))
+            .when(panels.right_panel > 0.0, |root| {
+                root.child(
+                    div()
                         .h_full()
-                        .flex_none(),
-                ))
+                        .flex_none()
+                        .w(px(panels.right_panel))
+                        .flex()
+                        .relative()
+                        .when(panels.right_panel_sliding, |element| {
+                            element.overflow_hidden()
+                        })
+                        // Pinned to the window's right edge, so the panel is
+                        // uncovered from that edge inward rather than dragged
+                        // across the screen.
+                        .child(
+                            self.right_panel_pane.clone().cached(
+                                StyleRefinement::default()
+                                    .absolute()
+                                    .top_0()
+                                    .right_0()
+                                    .w(px(panels.right_panel_content))
+                                    .h_full(),
+                            ),
+                        ),
+                )
             })
             .children(command_palette)
             .children(commit_dialog)
+            .children(goal_dialog)
             .children(image_preview)
+            .children(task_switcher)
             .into_any_element();
 
         self.render_window_frame(content, window, cx)
@@ -321,7 +469,7 @@ impl Waku {
         let text_ctx = MarkdownCtx::new(
             format!("toast-{generation}"),
             &palette,
-            MarkdownMetrics::COMPACT,
+            self.scaled_markdown_metrics(MarkdownMetrics::COMPACT),
             self.toast_selection.clone(),
         );
         let message = md::render::plain_text(
@@ -384,8 +532,8 @@ impl Waku {
                     .flex()
                     .items_center()
                     .gap(px(8.0))
-                    .text_size(px(11.5))
-                    .line_height(px(16.0))
+                    .text_size(sp(12.5))
+                    .line_height(sp(16.0))
                     .text_color(theme.text)
                     .on_hover(cx.listener(|this, hovering: &bool, _, cx| {
                         this.set_toast_hovered(*hovering, cx);

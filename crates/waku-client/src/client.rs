@@ -16,7 +16,7 @@ use uuid::Uuid;
 use waku_protocol::MAX_WIRE_MESSAGE_BYTES;
 use waku_protocol::{
     ClientMessage, Command, PROTOCOL_VERSION, ReplayCursor, Request, ResponseOutcome,
-    ResponsePayload, RpcError, SequencedEvent, ServerMessage, WireDriverEvent,
+    ResponsePayload, RpcError, SequencedEvent, ServerMessage,
 };
 
 const READ_POLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -135,6 +135,19 @@ impl DaemonClient {
             }
         }
         receiver
+    }
+
+    /// Whether two handles send through the same WebSocket connection.
+    ///
+    /// The daemon supervisor publishes replacement clients after a managed
+    /// restart. Runtime adapters use this identity check to ignore the
+    /// subscription's initial snapshot and wait for an actual replacement.
+    pub fn same_connection(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    pub fn is_disconnected(&self) -> bool {
+        self.inner.disconnected.load(Ordering::Acquire)
     }
 
     pub fn unsubscribe(&self, session_id: Uuid, runtime_id: Uuid) {
@@ -339,25 +352,12 @@ fn run_client(
             message: "Waku daemon disconnected".into(),
         }));
     }
-    let sessions = std::mem::take(&mut *inner.sessions.lock());
-    for ((session_id, runtime_id), events) in sessions {
-        // This event is synthesized locally and is not present in the
-        // daemon's replay journal. Do not advance the replay cursor for it or
-        // reconnecting to the same daemon would skip the next real event.
-        let (epoch, sequence) = inner
-            .last_sequences
-            .lock()
-            .get(&(session_id, runtime_id))
-            .map(|cursor| (cursor.epoch, cursor.sequence))
-            .unwrap_or((Uuid::nil(), 0));
-        let _ = events.send(SequencedEvent {
-            session_id,
-            runtime_id,
-            epoch,
-            sequence,
-            event: WireDriverEvent::new("processExited", serde_json::Value::Null),
-        });
-    }
+    // Closing the desktop transport is not evidence that a daemon-owned
+    // provider exited. Drop the subscription senders so runtime adapters can
+    // hand off to a replacement client and ask the daemon whether the same
+    // runtime still exists. Real provider exits arrive through the replayable
+    // `processExited` event emitted by the daemon.
+    drop(std::mem::take(&mut *inner.sessions.lock()));
     inner.task_state_subscribers.lock().clear();
 }
 

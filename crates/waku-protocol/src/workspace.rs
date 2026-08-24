@@ -79,6 +79,8 @@ pub enum WorkspaceOperation {
         provider: ProviderKind,
         #[ts(type = "string")]
         project_root: PathBuf,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        binary_override: Option<String>,
     },
     CreateProjectlessWorkspace {
         prompt: Option<String>,

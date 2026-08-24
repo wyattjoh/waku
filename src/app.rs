@@ -27,7 +27,7 @@ use crate::computer_use::{
 };
 use crate::driver::{self, DriverHandle, DriverStartOptions, SessionOptions};
 use crate::git_branch::BranchSnapshot;
-use crate::input::{ComposerAttachmentPaste, ComposerEvent, ComposerInput};
+use crate::input::{ComposerAttachmentPaste, ComposerEvent, ComposerInput, InputEvent, TextInput};
 use crate::md;
 use crate::model::{
     ActivityItem, ActivityKind, AgentSession, BackgroundWorkEvent, BackgroundWorkItem,
@@ -54,23 +54,24 @@ use crate::ui::tooltip::Tooltip;
 use crate::browser::BrowserView;
 use crate::persistence::{
     ComposerDraftStore, ComposerDrafts, DEFAULT_RIGHT_PANEL_WIDTH, DEFAULT_SIDEBAR_WIDTH,
-    PersistedState, PersistedWindowState, StateStore,
+    PersistedState, PersistedWindowState, SidebarGrouping, SidebarOrdering, StateStore,
 };
 use crate::query::{Query, QueryCache};
 use crate::review_diff::{Snapshot as ReviewDiffSnapshot, Source as ReviewDiffSource};
 use crate::terminal::TerminalView;
-use crate::theme::{Theme, ThemePreference};
+use crate::theme::{Theme, ThemePreference, sp};
 use crate::ui::text_field::TextField;
 use crate::ui::{
     MenuChip, ProjectNameSelector, activity_icon, activity_noun, contain_scroll, file_icon, icon,
     icon_button, motion, provider_color, provider_icon, status_color, toggle_switch,
 };
 use crate::{
-    CancelTurn, CloseFind, CloseWindow, CopySelection, FindNext, FindPrevious, FocusComposer,
-    NavigateBack, NavigateForward, NewProject, NewSession, OpenFind, OpenFindReplace, OpenSettings,
-    ReplaceAllMatches, SaveFile, ToggleCommandPalette, ToggleFindCaseSensitive, ToggleFindRegex,
-    ToggleFindWholeWord, ToggleFpsCounter, ToggleModelPicker, ToggleRightPanel, ToggleSidebar,
-    ToggleUsagePanel,
+    CancelTaskSwitch, CancelTurn, CloseFind, CloseWindow, ConfirmTaskSwitch, CopySelection,
+    FindNext, FindPrevious, FocusComposer, NavigateBack, NavigateForward, NewProject, NewSession,
+    OpenFind, OpenFindReplace, OpenSettings, ReplaceAllMatches, SaveFile, SelectFirstTask,
+    SelectLastTask, SwitchTaskBackward, SwitchTaskForward, ToggleCommandPalette,
+    ToggleFindCaseSensitive, ToggleFindRegex, ToggleFindWholeWord, ToggleFpsCounter,
+    ToggleModelPicker, ToggleRightPanel, ToggleSidebar, ToggleUsagePanel,
 };
 
 #[cfg(target_os = "macos")]
@@ -320,9 +321,10 @@ enum RemoteImageState {
     Unavailable,
 }
 
-/// One accepted composer submission. `prompt` is the exact provider-facing
-/// text; presentation metadata keeps its appended attachment mentions out of
-/// the user bubble.
+/// One accepted composer submission. `prompt` preserves the composer and
+/// transcript syntax; provider-specific command syntax resolves only at the
+/// transport boundary. Presentation metadata keeps appended attachment
+/// mentions out of the user bubble.
 #[derive(Clone, Debug)]
 struct ComposerSubmission {
     prompt: String,
@@ -558,7 +560,7 @@ struct DriverStartRequest {
     provider: ProviderKind,
     options: DriverStartOptions,
     event_wake: smol::channel::Sender<()>,
-    daemon_client: waku_client::DaemonClient,
+    daemon: waku_client::DaemonSupervisor,
 }
 
 /// A provider process that has started off-thread but is not installed into
@@ -669,12 +671,31 @@ impl WakuPane {
         content: fn(&mut Waku, &mut Window, &mut Context<Waku>) -> AnyElement,
         cx: &mut App,
     ) -> Entity<Self> {
-        cx.new(|_| Self { waku: None, content })
+        cx.new(|_| Self {
+            waku: None,
+            content,
+        })
     }
 
     fn bind(&mut self, waku: &Entity<Waku>, cx: &mut Context<Self>) {
         self.waku = Some(waku.downgrade());
-        cx.observe(waku, |_, _, cx| cx.notify()).detach();
+        cx.observe(waku, |_, waku, cx| {
+            // A panel slide notifies the root at display rate for its 200ms,
+            // and this fan-out would price every one of those ticks at a
+            // three-island rebuild. Skipping it hands the decision to the
+            // cached-view keys: the sliding panel (its clip moves) and the
+            // transcript (its bounds move) miss their caches and re-render
+            // with fresh state anyway, while the island nothing is moving
+            // re-plays its cached subtree. Root-state changes it displays
+            // can wait out the slide: updates born inside an island
+            // (terminal output, pulse leases) dirty their ancestor pane
+            // without this observer, and the slide's retirement notify
+            // below re-runs the fan-out, so nothing outlasts the 200ms.
+            if !waku.read(cx).panels_sliding() {
+                cx.notify();
+            }
+        })
+        .detach();
     }
 }
 
@@ -689,7 +710,7 @@ impl Render for WakuPane {
 }
 
 struct RightPanelFileEditor {
-    state: Entity<ComposerInput>,
+    state: Entity<TextInput>,
     disk_content: String,
     writable: bool,
     dirty: bool,
@@ -767,7 +788,7 @@ fn traits_choice(theme: Theme, label: String, is_default: bool, selected: bool) 
             .when(is_default, |element| {
                 element.child(
                     div()
-                        .h(px(16.0))
+                        .h(px(18.0))
                         .px(px(5.0))
                         .flex_none()
                         .rounded(px(4.0))
@@ -776,7 +797,7 @@ fn traits_choice(theme: Theme, label: String, is_default: bool, selected: bool) 
                         .bg(theme.overlay)
                         .flex()
                         .items_center()
-                        .text_size(px(9.0))
+                        .text_size(sp(12.5))
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(theme.text_tertiary)
                         .child(tr!("common.default")),
@@ -792,6 +813,10 @@ fn traits_choice(theme: Theme, label: String, is_default: bool, selected: bool) 
 #[derive(Clone, Copy, Debug)]
 struct UserMessageAction {
     session_id: Uuid,
+    /// The prompt that opened the turn. A turn can hold several user messages
+    /// once a steer lands in it, and only the opening one is a rewind
+    /// boundary, so this is what the editor and the rewind both address.
+    message_id: Uuid,
     turn_count: usize,
 }
 
@@ -806,6 +831,9 @@ struct AssistantMessageAction {
 #[derive(Clone)]
 struct MessageEdit {
     session_id: Uuid,
+    /// Identifies the edited bubble outright. Matching by turn alone would
+    /// open this one input on every user message the turn holds.
+    message_id: Uuid,
     turn_count: usize,
     input: Entity<ComposerInput>,
     attachments: Vec<MessageAttachment>,
@@ -909,8 +937,8 @@ struct ComputerUsePreview {
 struct SessionNavigation {
     back: Vec<Uuid>,
     forward: Vec<Uuid>,
-    /// The unstarted task behind the global New Task entry. Viewing another
-    /// session must not make that entry forget the project chosen for it.
+    /// The most recently selected unstarted task. The global New Task entry
+    /// may reuse it only when it belongs to the currently selected project.
     new_task: Option<Uuid>,
 }
 
@@ -954,11 +982,17 @@ impl SessionNavigation {
         self.new_task = Some(session_id);
     }
 
-    fn remembered_new_task(&self, sessions: &[AgentSession]) -> Option<Uuid> {
+    fn remembered_new_task(
+        &self,
+        sessions: &[AgentSession],
+        current_project_id: Uuid,
+    ) -> Option<Uuid> {
         self.new_task.filter(|session_id| {
-            sessions
-                .iter()
-                .any(|session| session.id == *session_id && !session.has_started())
+            sessions.iter().any(|session| {
+                session.id == *session_id
+                    && session.project_id == current_project_id
+                    && !session.has_started()
+            })
         })
     }
 }
@@ -1018,17 +1052,18 @@ pub struct Waku {
     /// without consulting the environment or account database in a frame.
     home_directory: Option<PathBuf>,
     composer: Entity<ComposerInput>,
-    user_input_answer: Entity<ComposerInput>,
+    user_input_answer: Entity<TextInput>,
     /// Drafts are independent of transcript persistence: started tasks key by
     /// session id, while blank New Task pages key by project id.
     composer_drafts: ComposerDrafts,
     composer_draft_store: ComposerDraftStore,
     composer_draft_save_generation: u64,
     command_palette: command_palette::CommandPaletteUi,
-    model_search: Entity<ComposerInput>,
-    settings_search: Entity<ComposerInput>,
-    daemon_port_input: Entity<ComposerInput>,
-    daemon_origins_input: Entity<ComposerInput>,
+    task_switcher: task_switcher::TaskSwitcherUi,
+    model_search: Entity<TextInput>,
+    settings_search: Entity<TextInput>,
+    daemon_port_input: Entity<TextInput>,
+    daemon_origins_input: Entity<TextInput>,
     daemon_reconfigure_pending: bool,
     daemon_token_revealed: bool,
     settings_focus: FocusHandle,
@@ -1072,7 +1107,7 @@ pub struct Waku {
     /// The provider row expanded on the Providers page, if any. The binary
     /// override input below edits this provider's entry.
     expanded_provider_settings: Option<ProviderKind>,
-    provider_path_input: Entity<ComposerInput>,
+    provider_path_input: Entity<TextInput>,
     computer_permissions: ComputerPermissions,
     computer_permission_tx: Sender<Result<ComputerPermissions, String>>,
     computer_permission_events: Receiver<Result<ComputerPermissions, String>>,
@@ -1124,7 +1159,7 @@ pub struct Waku {
     usage_months_scroll: ScrollHandle,
     usage_months_scrollbar: Rc<ScrollbarState>,
     /// Filter query over the Usage page's project rows.
-    usage_project_filter: Entity<ComposerInput>,
+    usage_project_filter: Entity<TextInput>,
     /// Virtualized list over the filtered project rows, so only visible rows
     /// build elements no matter how many working directories have usage.
     usage_projects_list: ListState,
@@ -1142,14 +1177,24 @@ pub struct Waku {
     usage_chart_bounds: Rc<Cell<Option<gpui::Bounds<Pixels>>>>,
     computer_use_app_icons: RefCell<HashMap<String, Option<std::sync::Arc<gpui::Image>>>>,
     computer_use_app_icon_loads: RefCell<HashSet<String>>,
+    /// Installed folder-capable apps for the header's "open project in"
+    /// control, icons included, resolved once at launch on the background
+    /// executor. Render only reads this; empty means not resolved yet (or
+    /// nothing to offer) and hides the control.
+    open_in_apps: Rc<Vec<crate::platform::ExternalApp>>,
     model_picker_tab: ModelPickerTab,
     /// Keyboard cursor over the model picker's filtered rows. `None` means the
     /// keyboard has not moved yet, so `enter` takes the first row.
     model_picker_highlight: Option<usize>,
     model_picker_scroll: ScrollHandle,
     model_picker_scrollbar: Rc<ScrollbarState>,
-    branch_search: Entity<ComposerInput>,
-    branch_create_input: Entity<ComposerInput>,
+    /// Focus for the picker's no-providers state. The panel takes focus on
+    /// open so `escape` has a focused descendant to dispatch up from, and
+    /// normally that is the filter field — which the empty state does not
+    /// draw, so its one button holds focus instead.
+    model_picker_empty_focus: FocusHandle,
+    branch_search: Entity<TextInput>,
+    branch_create_input: Entity<TextInput>,
     branch_picker_mode: BranchPickerMode,
     /// Keyboard cursor over the branch picker's enabled actions. Disabled
     /// rows remain visible but never enter this index.
@@ -1166,22 +1211,38 @@ pub struct Waku {
     /// Window-modal Git commit/push UI. Its repository snapshot is filled
     /// off-thread; frames only read this in-memory value.
     commit_dialog: Option<commit_dialog::CommitDialogState>,
+    goal_dialog: Option<goal_dialog::GoalDialogState>,
+    goal_dialog_request: Option<goal_dialog::GoalDialogRequest>,
+    /// Goal operations accepted before the session's runtime exists. Goals
+    /// attach to the provider thread, not to any turn, so `/goal` on a fresh
+    /// task starts the provider and these drain once it installs.
+    pending_goal_operations: HashMap<Uuid, Vec<crate::model::GoalOperation>>,
+    /// Sessions whose runtime is being started by a goal operation rather
+    /// than a submission. Submissions queue behind this instead of racing a
+    /// second provider process into existence.
+    goal_runtime_starts: HashSet<Uuid>,
+    /// When each session's goal accounting was last reported. The chip adds
+    /// the wall clock since then while an active goal's turn runs, so elapsed
+    /// pursuit time ticks live the way the Codex CLI shows it.
+    goal_observed_at: HashMap<Uuid, Instant>,
     /// Commit-message generation and Git mutation outlive the modal that
     /// started them. Keeping the operation on the app also lets every
     /// Environment surface reflect and gate the same in-flight action.
     commit_operation: Option<commit_dialog::CommitOperationState>,
-    /// Slash commands discovered per (provider, project root). Filesystem
-    /// walks live on the background executor; frames read the index below.
-    slash_commands: QueryCache<(ProviderKind, PathBuf), Vec<SlashCommand>>,
+    /// Slash commands discovered per (provider, project root, CLI override).
+    /// Filesystem and CLI probes live off the UI thread; frames read this cache.
+    slash_commands: QueryCache<(ProviderKind, PathBuf, Option<String>), Vec<SlashCommand>>,
     /// The merged command list the autocomplete popup draws, and the key it
     /// was built for — a stale key means "no commands", never another
     /// provider's list.
     slash_command_index: Rc<Vec<SlashCommand>>,
-    slash_command_index_key: Option<(ProviderKind, PathBuf)>,
+    slash_command_index_key: Option<(ProviderKind, PathBuf, Option<String>)>,
+    slash_command_index_loading: bool,
     /// Workspace file index per project root, for `@` mentions.
     mention_files: QueryCache<PathBuf, Vec<FileEntry>>,
     mention_file_index: Rc<Vec<FileEntry>>,
     mention_file_index_path: Option<PathBuf>,
+    mention_file_index_loading: bool,
     /// Set when a driver reports its command registry mid-drain; the drain
     /// has no `Context` to rebuild the drawn index itself.
     composer_sources_stale: bool,
@@ -1251,14 +1312,33 @@ pub struct Waku {
     session_rename: Option<Uuid>,
     /// One stable field reused across sidebar rows so virtualization never
     /// replaces the focused editor while a rename is in progress.
-    session_rename_input: Entity<ComposerInput>,
-    /// Date groups the user has folded in the sidebar. This is intentionally
-    /// runtime-only, like transcript disclosure state.
-    sidebar_collapsed_groups: HashSet<SessionDateGroup>,
+    session_rename_input: Entity<TextInput>,
+    /// Groups the user has folded in either sidebar view. This is
+    /// intentionally runtime-only, like transcript disclosure state.
+    sidebar_collapsed_groups: HashSet<SidebarGroup>,
+    /// Number of older sessions revealed inside each project section. This is
+    /// runtime-only so every launch starts with the recent three-day view.
+    sidebar_project_reveal_counts: HashMap<SidebarGroup, usize>,
+    /// Stable keyboard focus for each virtualized sidebar group header and
+    /// its hover-revealed New Task control.
+    sidebar_group_header_focuses: RefCell<HashMap<SidebarGroup, FocusHandle>>,
+    sidebar_group_compose_focuses: RefCell<HashMap<SidebarGroup, FocusHandle>>,
+    /// Stable keyboard focus for each virtualized project-history reveal row.
+    sidebar_show_more_focuses: RefCell<HashMap<SidebarGroup, FocusHandle>>,
     sidebar_visible: bool,
     sidebar_width: f32,
     right_panel_visible: bool,
     right_panel_width: f32,
+    /// The show/hide slide each panel is in the middle of, if any. Driven by
+    /// hand from `render` (see [`motion::WidthTween`]) because the width these
+    /// produce is what the transcript column between them is laid out against.
+    sidebar_slide: Option<motion::WidthTween>,
+    right_panel_slide: Option<motion::WidthTween>,
+    /// Width each panel actually occupied in the last frame — where a toggle
+    /// starts its slide from, and what the transcript measures itself against
+    /// while one is running.
+    sidebar_rendered_width: f32,
+    right_panel_rendered_width: f32,
     fps_counter_visible: bool,
     panel_resize_drag: Option<PanelResizeDrag>,
     right_panel_session_states: HashMap<Uuid, RightPanelSessionState>,
@@ -1267,7 +1347,7 @@ pub struct Waku {
     right_panel_tabs_scroll_handle: ScrollHandle,
     right_panel_files_scroll_handle: ScrollHandle,
     right_panel_files_scrollbar: Rc<ScrollbarState>,
-    right_panel_diff_filter: Entity<ComposerInput>,
+    right_panel_diff_filter: Entity<TextInput>,
     /// Unified diff rows and changed-file tree rows are independently
     /// virtualized. Large generated patches stay proportional to what is on
     /// screen rather than the size of the repository change.
@@ -1280,6 +1360,12 @@ pub struct Waku {
     right_panel_diff_tree_scrollbar: Rc<ScrollbarState>,
     right_panel_editor_scroll_handle: ScrollHandle,
     right_panel_editor_scrollbar: Rc<ScrollbarState>,
+    /// Rendered-markdown preview of the visible file editor, cached per path
+    /// the way `skills_detail_markdown` caches the skill document.
+    file_preview_markdown: RefCell<Option<(String, MarkdownView)>>,
+    file_preview_selection: TranscriptSelection,
+    file_preview_scroll_handle: ScrollHandle,
+    file_preview_scrollbar: Rc<ScrollbarState>,
     right_panel_pending_tab_reveal: Option<usize>,
     right_panel_pending_terminal_focus: Option<Uuid>,
     right_panel_expanded_paths: HashSet<PathBuf>,
@@ -1328,7 +1414,7 @@ pub struct Waku {
     /// When the current catalog landed, for the reopen-staleness check.
     skills_scanned_at: Option<Instant>,
     /// Filter query over the Skills page's rows.
-    skills_search: Entity<ComposerInput>,
+    skills_search: Entity<TextInput>,
     /// Virtualized list over the filtered skill rows.
     skills_list_state: ListState,
     skills_scrollbar: Rc<ScrollbarState>,
@@ -1382,6 +1468,11 @@ pub struct Waku {
     /// Fingerprint + snapshot pair backing `sidebar_rows_cached`.
     sidebar_rows_fingerprint: Cell<Option<u64>>,
     sidebar_rows_snapshot: RefCell<Rc<Vec<SidebarRow>>>,
+    /// Branch labels for ordinary local project paths, resolved together on a
+    /// background executor so sidebar rows only read memory.
+    sidebar_branch_labels: RefCell<HashMap<PathBuf, SharedString>>,
+    sidebar_branch_scan_fingerprint: Cell<Option<u64>>,
+    sidebar_branch_scan_generation: Cell<u64>,
     transcript_row_kinds: RefCell<Vec<TranscriptRowKind>>,
     /// Fingerprint of the transcript inputs `transcript_row_kinds` was folded
     /// from, so an unchanged transcript costs nothing on a frame. `None` until
@@ -1428,7 +1519,21 @@ pub struct Waku {
     transcript_anchor: Cell<Option<TranscriptAnchor>>,
     transcript_anchor_end_space: Rc<Cell<Pixels>>,
     transcript_anchor_following: Rc<Cell<bool>>,
+    /// A wheel scroll has landed and where it came to rest is not classified
+    /// yet. The first frame that can measure the tail consumes this and
+    /// re-engages following when the reader scrolled back onto it; a frame that
+    /// cannot measure the tail leaves it set, so a stream remeasure cannot
+    /// swallow the re-engage.
+    transcript_tail_recheck: Rc<Cell<bool>>,
     transcript_is_scrolled: Rc<Cell<bool>>,
+    /// Last decided visibility of the scroll-to-tail affordance. The tail's
+    /// position is unknowable on the frames a stream commit remeasures it, and
+    /// those arrive at commit cadence — deciding "show" from that silence
+    /// strobes the button against the frames in between.
+    transcript_scroll_to_bottom_visible: Cell<bool>,
+    /// Whether the transcript's scrollbar thumb was held at the last frame, so
+    /// render can notice a drag starting and ending.
+    transcript_scrollbar_dragging: Cell<bool>,
     transcript_layout_width: Cell<Pixels>,
     /// Parsed markdown per assistant message, keeping each response's
     /// incremental parse and flattened blocks alive across frames.
@@ -1441,12 +1546,26 @@ pub struct Waku {
     /// Independent capped viewports for expanded thoughts and command output.
     /// Keeping these stable preserves scroll position through virtualization.
     activity_scroll_viewports: RefCell<HashMap<Uuid, ActivityScrollViewport>>,
+    /// Positioned, syntax-tokenized diff rows for expanded file-change
+    /// activities. Built once when the activity is expanded and dropped when it
+    /// collapses or its changes are replaced, so a frame only indexes rows.
+    activity_diffs: RefCell<HashMap<Uuid, Rc<activity_diff::Diff>>>,
+    /// Viewports for those diffs. Separate from `activity_scroll_viewports`
+    /// because a failed edit shows both its diff and the error it returned.
+    activity_diff_viewports: RefCell<HashMap<Uuid, ActivityScrollViewport>>,
     /// One allocation for every transcript markdown context to share. The
     /// callback knows about the active workspace; the renderer deliberately
     /// does not.
     markdown_link_handler: md::render::LinkHandler,
     /// Transcript-wide text selection, spanning messages and tool output.
     transcript_selection: TranscriptSelection,
+    /// Programmatic focus for the transcript canvas. Clicking the transcript
+    /// moves focus here so the shared find action can distinguish it from the
+    /// right-panel file editor without putting the canvas in the tab order.
+    transcript_focus: FocusHandle,
+    /// Find-in-page state for the selected transcript, created lazily on the
+    /// first primary-modifier F press.
+    transcript_search: Option<transcript_search::TranscriptSearch>,
     /// Independent selection for the transient toast message. Keeping it out
     /// of the transcript registry prevents an overlay from joining a drag to
     /// whatever happens to be painted beneath it.
@@ -1472,11 +1591,13 @@ pub struct Waku {
     fps_value: u32,
 }
 
+mod activity_diff;
 mod autocomplete;
 mod background_work;
 mod branches;
 mod command_palette;
 mod commit_dialog;
+mod goal_dialog;
 mod components;
 mod composer;
 mod drafts;
@@ -1490,7 +1611,9 @@ mod settings;
 mod sidebar;
 mod skills_page;
 mod streaming;
+mod task_switcher;
 mod transcript;
+mod transcript_search;
 mod transcript_view;
 mod usage_meter;
 mod usage_page;
@@ -1502,11 +1625,12 @@ use background_work::{
 };
 pub use command_palette::init as init_command_palette;
 pub use commit_dialog::init as init_commit_dialog_keys;
+pub use goal_dialog::init as init_goal_dialog_keys;
 use components::*;
 pub use image_preview::init as init_image_preview_keys;
 pub use settings::init as init_settings_keys;
 pub use sidebar::init as init_sidebar_keys;
-use sidebar::{SessionDateGroup, SidebarRow};
+use sidebar::{SidebarGroup, SidebarRow};
 pub use skills_page::init as init_skills_keys;
 use streaming::*;
 use transcript::*;
@@ -1798,6 +1922,11 @@ impl Waku {
             eprintln!("could not normalize daemon settings after migration: {error:#}");
         }
         crate::i18n::set_language(state.language);
+        // Chrome text is authored in `sp` rems against the default UI font
+        // size, so the window's rem size *is* the UI font size setting.
+        window.set_rem_size(px(waku_client::persistence::sanitized_ui_font_size(
+            state.ui_font_size,
+        )));
         let analytics = crate::analytics::Analytics::new(
             state.language.locale(),
             state.analytics_id,
@@ -1816,75 +1945,69 @@ impl Waku {
                 .count(),
         });
 
-        let composer = cx.new(|cx| ComposerInput::new(window, cx).padding_x(px(14.0)));
+        let composer = cx.new(|cx| ComposerInput::new(window, cx).padding_x(px(14.0), cx));
         let user_input_answer = cx.new(|cx| {
-            ComposerInput::new(window, cx)
-                .search_field()
+            TextInput::new(window, cx)
                 .placeholder(tr!("user_input.other_placeholder"))
         });
         let command_palette_search = cx.new(|cx| {
-            ComposerInput::new(window, cx)
-                .search_field()
+            TextInput::new(window, cx)
+                .clear_on_escape()
                 .placeholder(tr!("command_palette.placeholder"))
         });
         let model_search = cx.new(|cx| {
-            ComposerInput::new(window, cx)
-                .search_field()
+            TextInput::new(window, cx)
+                .clear_on_escape()
                 .placeholder(tr!("input.search_models"))
         });
         let branch_search = cx.new(|cx| {
-            ComposerInput::new(window, cx)
-                .search_field()
+            TextInput::new(window, cx)
+                .clear_on_escape()
                 .placeholder(tr!("input.search_branches"))
         });
         let branch_create_input = cx.new(|cx| {
-            ComposerInput::new(window, cx)
-                .search_field()
+            TextInput::new(window, cx)
+                .clear_on_escape()
                 .placeholder(tr!("input.new_branch_name"))
         });
         let settings_search = cx.new(|cx| {
-            ComposerInput::new(window, cx)
-                .search_field()
+            TextInput::new(window, cx)
+                .clear_on_escape()
                 .placeholder(tr!("settings.search"))
         });
         let daemon_port = state.daemon_exposure.port.to_string();
         let daemon_origins = state.daemon_exposure.allowed_origins_text();
         let daemon_port_input = cx.new(|cx| {
-            let mut input = ComposerInput::new(window, cx)
-                .search_field()
+            let mut input = TextInput::new(window, cx)
                 .select_all_on_focus_click()
                 .placeholder(tr!("daemon.port_placeholder"));
             input.set_content(daemon_port, cx);
             input
         });
         let daemon_origins_input = cx.new(|cx| {
-            let mut input = ComposerInput::new(window, cx)
-                .search_field()
+            let mut input = TextInput::new(window, cx)
                 .select_all_on_focus_click()
                 .placeholder(tr!("daemon.allowed_origins_placeholder"));
             input.set_content(daemon_origins, cx);
             input
         });
         let skills_search = cx.new(|cx| {
-            ComposerInput::new(window, cx)
-                .search_field()
+            TextInput::new(window, cx)
+                .clear_on_escape()
                 .placeholder(tr!("skills.search"))
         });
-        let session_rename_input = cx.new(|cx| ComposerInput::new(window, cx).search_field());
+        let session_rename_input = cx.new(|cx| TextInput::new(window, cx));
         let provider_path_input = cx.new(|cx| {
-            ComposerInput::new(window, cx)
-                .search_field()
+            TextInput::new(window, cx)
                 .select_all_on_focus_click()
                 .placeholder(tr!("input.detected_automatically"))
         });
         let usage_project_filter = cx.new(|cx| {
-            ComposerInput::new(window, cx)
-                .search_field()
+            TextInput::new(window, cx)
                 .placeholder(tr!("input.filter_projects"))
         });
         let right_panel_diff_filter = cx.new(|cx| {
-            ComposerInput::new(window, cx)
-                .search_field()
+            TextInput::new(window, cx)
                 .placeholder(tr!("diff.filter_files"))
         });
         let navigation_rail = cx.new(|_| ConversationNavigationRail::new());
@@ -2098,27 +2221,44 @@ impl Waku {
         let branch_picker_list_state = ListState::new(0, ListAlignment::Top, px(152.0));
         let transcript_is_scrolled = Rc::new(Cell::new(false));
         let transcript_anchor_following = Rc::new(Cell::new(false));
+        let transcript_tail_recheck = Rc::new(Cell::new(false));
+        // A wheel scroll drops tail following and asks the next measured frame
+        // whether it landed back on the tail. GPUI re-engages its own tail pin
+        // when a bottom-aligned list reaches the end — it represents that end as
+        // no logical offset — but a turn renders through the top-aligned
+        // anchored list, whose end is an ordinary offset, so only this can.
         transcript_rows.set_scroll_handler({
             let transcript_is_scrolled = transcript_is_scrolled.clone();
             let transcript_anchor_following = transcript_anchor_following.clone();
+            let transcript_tail_recheck = transcript_tail_recheck.clone();
             move |event, window, _| {
                 transcript_is_scrolled.set(event.is_scrolled);
                 transcript_anchor_following.set(false);
+                transcript_tail_recheck.set(true);
                 window.refresh();
             }
         });
         anchored_transcript_rows.set_scroll_handler({
             let transcript_is_scrolled = transcript_is_scrolled.clone();
             let transcript_anchor_following = transcript_anchor_following.clone();
+            let transcript_tail_recheck = transcript_tail_recheck.clone();
             move |event, window, _| {
                 transcript_is_scrolled.set(event.is_scrolled);
                 transcript_anchor_following.set(false);
+                transcript_tail_recheck.set(true);
                 window.refresh();
             }
         });
         // Enable GPUI's experimental overlay plane so deferred draws (menus,
-        // tooltips, popovers) composite above native child views — without it
-        // the browser surface's WKWebView would cover them.
+        // tooltips, popovers) composite above native content — without it the
+        // browser surface would cover them.
+        //
+        // Both backends of the pinned fork implement it, and both browser
+        // hosts render somewhere it can reach: a sibling NSView below GPUI's
+        // overlay layer on macOS, a DirectComposition visual between GPUI's
+        // base and overlay planes on Windows. When it is unavailable the
+        // surface falls back to freezing the page to a bitmap while an
+        // overlay is open.
         let scene_overlay_enabled = window.enable_scene_overlay().is_ok();
         let (updater_status, updater_events) = cx
             .try_global::<crate::updater::UpdaterState>()
@@ -2130,6 +2270,20 @@ impl Waku {
             let onboarding_add_project_focus = cx.focus_handle();
             let onboarding_projectless_focus = cx.focus_handle();
             let updater_button_focus = cx.focus_handle();
+            let model_picker_empty_focus = cx.focus_handle();
+            let task_switcher_focus = cx.focus_handle();
+            cx.on_focus_out(
+                &task_switcher_focus,
+                window,
+                |this: &mut Self, _, window, cx| {
+                    this.cancel_task_switcher(window, cx);
+                },
+            )
+            .detach();
+            let mut task_switcher = task_switcher::TaskSwitcherUi::new(task_switcher_focus);
+            if let Some(selected_session) = state.selected_session {
+                task_switcher.record_access(selected_session);
+            }
 
             cx.on_focus(&updater_button_focus, window, |this: &mut Self, _, cx| {
                 this.set_updater_button_focused(true, cx);
@@ -2233,6 +2387,15 @@ impl Waku {
                             this.steer_composer_submission(submission, cx);
                         }
                     }
+                    ComposerEvent::SteerQueued => {
+                        // Staged attachments make this a real draft even when
+                        // the text field is empty. Preserve the shortcut's
+                        // previous no-op behavior until that draft is sent or
+                        // cleared.
+                        if this.composer_attachments.is_empty() {
+                            this.steer_oldest_queued_message(cx);
+                        }
+                    }
                     ComposerEvent::Edited => {
                         this.schedule_composer_draft_save(cx);
                         cx.notify();
@@ -2250,15 +2413,15 @@ impl Waku {
 
             cx.subscribe(
                 &user_input_answer,
-                |this: &mut Self, input, event: &ComposerEvent, cx| match event {
-                    ComposerEvent::Submit(answer) | ComposerEvent::SubmitSteer(answer) => {
+                |this: &mut Self, input, event: &InputEvent, cx| match event {
+                    InputEvent::Submit(answer) => {
                         this.submit_user_input_custom_answer(answer.clone(), cx);
                     }
-                    ComposerEvent::Edited => {
+                    InputEvent::Edited => {
                         let answer = input.read(cx).content().to_owned();
                         this.update_user_input_custom_answer(answer, cx);
                     }
-                    ComposerEvent::Focus | ComposerEvent::BackspaceOnEmpty => {}
+                    InputEvent::Focus | InputEvent::BackspaceOnEmpty => {}
                 },
             )
             .detach();
@@ -2308,8 +2471,8 @@ impl Waku {
             // state — nothing highlighted, the current model's row in view.
             cx.subscribe(
                 &model_search,
-                |this: &mut Self, search, event: &ComposerEvent, cx| {
-                    if matches!(event, ComposerEvent::Edited) {
+                |this: &mut Self, search, event: &InputEvent, cx| {
+                    if matches!(event, InputEvent::Edited) {
                         if search.read(cx).content().trim().is_empty() {
                             this.model_picker_highlight = None;
                             this.reveal_selected_picker_model();
@@ -2324,8 +2487,8 @@ impl Waku {
             .detach();
             cx.subscribe(
                 &command_palette_search,
-                |this: &mut Self, search, event: &ComposerEvent, cx| {
-                    if matches!(event, ComposerEvent::Edited) {
+                |this: &mut Self, search, event: &InputEvent, cx| {
+                    if matches!(event, InputEvent::Edited) {
                         let query = search.read(cx).content().to_owned();
                         this.command_palette_query_edited(&query, cx);
                     }
@@ -2334,8 +2497,8 @@ impl Waku {
             .detach();
             cx.subscribe(
                 &branch_search,
-                |this: &mut Self, search, event: &ComposerEvent, cx| {
-                    if matches!(event, ComposerEvent::Edited)
+                |this: &mut Self, search, event: &InputEvent, cx| {
+                    if matches!(event, InputEvent::Edited)
                         && this.branch_picker_mode == BranchPickerMode::Browse
                     {
                         if search.read(cx).content().trim().is_empty() {
@@ -2351,8 +2514,8 @@ impl Waku {
             .detach();
             cx.subscribe(
                 &branch_create_input,
-                |_: &mut Self, _, event: &ComposerEvent, cx| {
-                    if matches!(event, ComposerEvent::Edited) {
+                |_: &mut Self, _, event: &InputEvent, cx| {
+                    if matches!(event, InputEvent::Edited) {
                         cx.notify();
                     }
                 },
@@ -2360,8 +2523,8 @@ impl Waku {
             .detach();
             cx.subscribe(
                 &settings_search,
-                |_: &mut Self, _, event: &ComposerEvent, cx| {
-                    if matches!(event, ComposerEvent::Edited) {
+                |_: &mut Self, _, event: &InputEvent, cx| {
+                    if matches!(event, InputEvent::Edited) {
                         cx.notify();
                     }
                 },
@@ -2370,9 +2533,9 @@ impl Waku {
             for input in [&daemon_port_input, &daemon_origins_input] {
                 cx.subscribe(
                     input,
-                    |this: &mut Self, _, event: &ComposerEvent, cx| match event {
-                        ComposerEvent::Submit(_) => this.apply_daemon_exposure_fields(cx),
-                        ComposerEvent::Edited => cx.notify(),
+                    |this: &mut Self, _, event: &InputEvent, cx| match event {
+                        InputEvent::Submit(_) => this.apply_daemon_exposure_fields(cx),
+                        InputEvent::Edited => cx.notify(),
                         _ => {}
                     },
                 )
@@ -2380,8 +2543,8 @@ impl Waku {
             }
             cx.subscribe(
                 &skills_search,
-                |_: &mut Self, _, event: &ComposerEvent, cx| {
-                    if matches!(event, ComposerEvent::Edited) {
+                |_: &mut Self, _, event: &InputEvent, cx| {
+                    if matches!(event, InputEvent::Edited) {
                         cx.notify();
                     }
                 },
@@ -2389,17 +2552,17 @@ impl Waku {
             .detach();
             cx.subscribe(
                 &session_rename_input,
-                |this: &mut Self, _, event: &ComposerEvent, cx| match event {
-                    ComposerEvent::Submit(_) => this.commit_session_rename(cx),
-                    ComposerEvent::Edited if this.session_rename.is_some() => cx.notify(),
+                |this: &mut Self, _, event: &InputEvent, cx| match event {
+                    InputEvent::Submit(_) => this.commit_session_rename(cx),
+                    InputEvent::Edited if this.session_rename.is_some() => cx.notify(),
                     _ => {}
                 },
             )
             .detach();
             cx.subscribe(
                 &usage_project_filter,
-                |_: &mut Self, _, event: &ComposerEvent, cx| {
-                    if matches!(event, ComposerEvent::Edited) {
+                |_: &mut Self, _, event: &InputEvent, cx| {
+                    if matches!(event, InputEvent::Edited) {
                         cx.notify();
                     }
                 },
@@ -2407,8 +2570,8 @@ impl Waku {
             .detach();
             cx.subscribe(
                 &right_panel_diff_filter,
-                |this: &mut Self, _, event: &ComposerEvent, cx| {
-                    if matches!(event, ComposerEvent::Edited) {
+                |this: &mut Self, _, event: &InputEvent, cx| {
+                    if matches!(event, InputEvent::Edited) {
                         this.sync_right_panel_diff_tree_rows(cx);
                         cx.notify();
                     }
@@ -2417,8 +2580,8 @@ impl Waku {
             .detach();
             cx.subscribe(
                 &provider_path_input,
-                |this: &mut Self, _, event: &ComposerEvent, cx| {
-                    if matches!(event, ComposerEvent::Submit(_)) {
+                |this: &mut Self, _, event: &InputEvent, cx| {
+                    if matches!(event, InputEvent::Submit(_)) {
                         this.apply_provider_path_override(cx);
                     }
                 },
@@ -2544,6 +2707,7 @@ impl Waku {
                 composer_draft_store,
                 composer_draft_save_generation: 0,
                 command_palette: command_palette::CommandPaletteUi::new(command_palette_search),
+                task_switcher,
                 model_search,
                 branch_search,
                 branch_create_input,
@@ -2614,10 +2778,12 @@ impl Waku {
                 usage_chart_bounds: Rc::default(),
                 computer_use_app_icons: RefCell::new(HashMap::new()),
                 computer_use_app_icon_loads: RefCell::new(HashSet::new()),
+                open_in_apps: Rc::new(Vec::new()),
                 model_picker_tab,
                 model_picker_highlight: None,
                 model_picker_scroll: ScrollHandle::new(),
                 model_picker_scrollbar: ScrollbarState::new(),
+                model_picker_empty_focus,
                 branch_picker_mode: BranchPickerMode::Browse,
                 branch_picker_highlight: None,
                 branch_picker_list_state,
@@ -2626,15 +2792,22 @@ impl Waku {
                 visible_branch_snapshot: None,
                 branch_operation_pending: false,
                 commit_dialog: None,
+                goal_dialog: None,
+                goal_dialog_request: None,
+                pending_goal_operations: HashMap::new(),
+                goal_runtime_starts: HashSet::new(),
+                goal_observed_at: HashMap::new(),
                 commit_operation: None,
                 // Providers × workspaces; both scans are small, the cache
                 // only exists to keep them off the frame path.
                 slash_commands: QueryCache::new(2 * MAX_CACHED_WORKSPACES),
                 slash_command_index: Rc::new(Vec::new()),
                 slash_command_index_key: None,
+                slash_command_index_loading: false,
                 mention_files: QueryCache::new(MAX_CACHED_WORKSPACES),
                 mention_file_index: Rc::new(Vec::new()),
                 mention_file_index_path: None,
+                mention_file_index_loading: false,
                 composer_sources_stale: false,
                 composer_autocomplete: autocomplete::AutocompleteUi::new(),
                 composer_attachments,
@@ -2664,10 +2837,22 @@ impl Waku {
                 session_rename: None,
                 session_rename_input,
                 sidebar_collapsed_groups: HashSet::new(),
+                sidebar_project_reveal_counts: HashMap::new(),
+                sidebar_group_header_focuses: RefCell::new(HashMap::new()),
+                sidebar_group_compose_focuses: RefCell::new(HashMap::new()),
+                sidebar_show_more_focuses: RefCell::new(HashMap::new()),
                 sidebar_visible,
                 sidebar_width,
                 right_panel_visible,
                 right_panel_width,
+                sidebar_slide: None,
+                right_panel_slide: None,
+                sidebar_rendered_width: if sidebar_visible { sidebar_width } else { 0.0 },
+                right_panel_rendered_width: if right_panel_visible {
+                    right_panel_width
+                } else {
+                    0.0
+                },
                 fps_counter_visible: false,
                 panel_resize_drag: None,
                 right_panel_session_states: HashMap::new(),
@@ -2685,6 +2870,10 @@ impl Waku {
                 right_panel_diff_tree_scrollbar: ScrollbarState::new(),
                 right_panel_editor_scroll_handle: ScrollHandle::new(),
                 right_panel_editor_scrollbar: ScrollbarState::new(),
+                file_preview_markdown: RefCell::new(None),
+                file_preview_selection: TranscriptSelection::default(),
+                file_preview_scroll_handle: ScrollHandle::new(),
+                file_preview_scrollbar: ScrollbarState::new(),
                 right_panel_pending_tab_reveal: None,
                 right_panel_pending_terminal_focus: None,
                 right_panel_expanded_paths: HashSet::new(),
@@ -2751,6 +2940,9 @@ impl Waku {
                 sidebar_row_cache: RefCell::new(Vec::new()),
                 sidebar_rows_fingerprint: Cell::new(None),
                 sidebar_rows_snapshot: RefCell::new(Rc::new(Vec::new())),
+                sidebar_branch_labels: RefCell::new(HashMap::new()),
+                sidebar_branch_scan_fingerprint: Cell::new(None),
+                sidebar_branch_scan_generation: Cell::new(0),
                 transcript_row_kinds: RefCell::new(Vec::new()),
                 transcript_row_kinds_fingerprint: Cell::new(None),
                 transcript_navigation_turns: RefCell::new(Rc::new(Vec::new())),
@@ -2766,14 +2958,21 @@ impl Waku {
                 transcript_anchor: Cell::new(None),
                 transcript_anchor_end_space: Rc::new(Cell::new(Pixels::ZERO)),
                 transcript_anchor_following,
+                transcript_tail_recheck,
                 transcript_is_scrolled,
+                transcript_scroll_to_bottom_visible: Cell::new(false),
+                transcript_scrollbar_dragging: Cell::new(false),
                 transcript_layout_width: Cell::new(Pixels::ZERO),
                 message_markdown: RefCell::new(HashMap::new()),
                 activity_markdown: RefCell::new(HashMap::new()),
                 reasoning_window_starts: RefCell::new(HashMap::new()),
                 activity_scroll_viewports: RefCell::new(HashMap::new()),
+                activity_diffs: RefCell::new(HashMap::new()),
+                activity_diff_viewports: RefCell::new(HashMap::new()),
                 markdown_link_handler,
                 transcript_selection: TranscriptSelection::default(),
+                transcript_focus: cx.focus_handle(),
+                transcript_search: None,
                 toast_selection: TranscriptSelection::default(),
                 transcript_scrollbar: ScrollbarState::new(),
                 menus: RefCell::new(HashMap::new()),
@@ -2815,6 +3014,9 @@ impl Waku {
             // The skill library too: the Skills settings page must open onto
             // data, not a scan.
             this.ensure_skills_catalog(false, cx);
+            // And the header's "open project in app" targets, so its menu
+            // lists installed apps and icons without ever probing on a frame.
+            this.detect_open_in_apps(cx);
         });
         entity
     }

@@ -30,6 +30,7 @@ import {
   activityDisclosureSections,
   activityDisplayTitle,
   activityFileChangeStats,
+  activityGroupIsLive,
   activityHeaderTitle,
   activityPreview,
   activityRowDetail,
@@ -199,7 +200,12 @@ export function Transcript({
     return () => resizeObserver.disconnect()
   }, [])
 
-  const empty = session.messages.length === 0 && session.transcript_blocks.length === 0
+  // Turns count as content even before any message or block exists: a
+  // provider-initiated turn (Codex goal continuation) reasons for a while
+  // before its first delta.
+  const empty = session.messages.length === 0
+    && session.transcript_blocks.length === 0
+    && session.turns.length === 0
   return (
     <TranscriptLinkContext.Provider value={onOpenLink ?? (() => false)}>
       <div className="relative min-h-0 flex-1" ref={root}>
@@ -535,7 +541,7 @@ type TranscriptRenderItem =
       kind: 'block'
       key: string
       block: AgentSession['transcript_blocks'][number]
-      liveTurn: boolean
+      liveGroup: boolean
     }
   | {
       kind: 'message'
@@ -607,13 +613,19 @@ function buildTranscriptItems(
     }
     if (folds.hidden.has(row.key) && !expandedTurns.has(row.turnId ?? '')) continue
     if (row.kind === 'block') {
+      const liveTurn = Boolean(
+        row.block.turn_id
+        && turns.get(row.block.turn_id)?.status === 'running'
+      )
       items.push({
         kind: 'block',
         key: row.key,
         block: row.block,
-        liveTurn: Boolean(
-          row.block.turn_id
-          && turns.get(row.block.turn_id)?.status === 'running',
+        liveGroup: activityGroupIsLive(
+          liveTurn,
+          row.index + 1 === session.transcript_blocks.length,
+          row.block.after_message,
+          session.messages.length,
         ),
       })
       continue
@@ -762,7 +774,7 @@ function TranscriptItemView({
       <ActivityGroup
         activities={activitiesForBlock(item.block)}
         backgroundWork={backgroundWork}
-        liveTurn={item.liveTurn}
+        liveGroup={item.liveGroup}
         t={t}
         onOpenBackgroundWork={onOpenBackgroundWork}
       />
@@ -1414,21 +1426,20 @@ function Markdown({
 function ActivityGroup({
   activities,
   backgroundWork,
-  liveTurn,
+  liveGroup,
   t,
   onOpenBackgroundWork,
 }: {
   activities: ActivityItem[]
   backgroundWork: BackgroundWorkItem[]
-  liveTurn: boolean
+  liveGroup: boolean
   t: Translator
   onOpenBackgroundWork?: (key: BackgroundWorkKey) => void
 }) {
-  const running = activities.some((activity) => !activity.complete)
-  const [expanded, setExpanded] = useState(running || liveTurn)
+  const [expanded, setExpanded] = useState(liveGroup)
   useEffect(() => {
-    if (running || liveTurn) setExpanded(true)
-  }, [running, liveTurn])
+    setExpanded(liveGroup)
+  }, [liveGroup])
   if (!activities.length) return null
   return (
     <div className="min-w-0 text-[12px] text-[var(--text-tertiary)]">
@@ -1438,7 +1449,7 @@ function ActivityGroup({
         type="button"
         onClick={() => setExpanded((value) => !value)}
       >
-        <span className="min-w-0 truncate text-left text-[12.5px] font-medium text-[var(--text-secondary)]">{activityHeaderTitle(activities, liveTurn, t)}</span>
+        <span className="min-w-0 truncate text-left text-[12.5px] font-medium text-[var(--text-secondary)]">{activityHeaderTitle(activities, liveGroup, t)}</span>
         <WakuIcon className="size-2.5 shrink-0" name={expanded ? 'chevronDown' : 'chevronRight'} />
       </button>
       {expanded && (

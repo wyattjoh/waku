@@ -5,6 +5,7 @@ import type {
   ProviderResumeCursor,
   ReportedCommand,
   SequencedEvent,
+  ThreadGoal,
   TranscriptBlock,
   TurnStatus,
 } from '@waku/client'
@@ -94,6 +95,25 @@ export function reduceRuntimeEvent(
       if (turn) {
         turn.provider_turn_started = true
         session.status = 'working'
+      } else if (
+        session.provider === 'codex'
+        && !['connecting', 'working', 'waiting'].includes(session.status)
+      ) {
+        // Codex starts turns on its own: goal continuation pursues an active
+        // goal whenever the thread is idle. Give the turn a transcript home —
+        // there is no user message for it — so its work streams in instead of
+        // being dropped.
+        session.turns.push({
+          id: clock.randomUUID(),
+          turn_count: session.turns.length + 1,
+          status: 'running',
+          provider_turn_started: true,
+          provider_resume_at: null,
+          started_at: clock.nowSeconds(),
+          completed_at: null,
+          checkpoint: null,
+        })
+        session.status = 'working'
       }
       break
     }
@@ -176,6 +196,18 @@ export function reduceRuntimeEvent(
       }
       break
     }
+    case 'goalUpdated': {
+      // Conversation meta like usage: it applies regardless of turn state,
+      // and `null` means the provider cleared the goal.
+      const goal = asThreadGoal(payload)
+      if (goal && session.messages.length === 0) {
+        // A goal-first task is named after its objective until the provider
+        // reports a better title.
+        setTitleFromPrompt(session, goal.objective)
+      }
+      session.thread_goal = goal
+      break
+    }
     case 'turnFinished': {
       const value = asRecord(payload)
       const success = value?.success === true
@@ -192,6 +224,21 @@ export function reduceRuntimeEvent(
     case 'error': {
       if (typeof payload !== 'string') break
       result.error = payload
+      // An optimistic pursuit turn has no submission to fail with. Unwind it
+      // so the error cannot strand a spinner; if the pursuit does start
+      // later, its own start report recreates the turn.
+      const pursuit = session.turns.at(-1)
+      if (
+        pursuit && pursuit.status === 'running'
+        && !pursuit.provider_turn_started
+        && !session.messages.some((message) => message.turn_id === pursuit.id)
+      ) {
+        session.turns.pop()
+        if (['connecting', 'working', 'waiting'].includes(session.status)) {
+          session.status = 'idle'
+        }
+        break
+      }
       const turn = activeTurn(session)
       if (!turn || session.status === 'working') break
       const hasAssistant = session.messages.some(
@@ -435,6 +482,24 @@ function ensureActivities(block: TranscriptBlock): ActivityItem[] {
   const activities = activitiesForBlock(block)
   block.content = { kind: 'activities', data: activities }
   return activities
+}
+
+function asThreadGoal(payload: unknown): ThreadGoal | null {
+  const value = asRecord(payload)
+  if (!value || typeof value.objective !== 'string' || typeof value.status !== 'string') {
+    return null
+  }
+  return value as unknown as ThreadGoal
+}
+
+/** Mirror of the desktop's prompt-derived title fallback: first seven words,
+ * ellipsized at 54 characters, applied only while the task is unnamed. */
+function setTitleFromPrompt(session: AgentSession, prompt: string) {
+  if (session.messages.length > 0 || session.title !== 'New task' || session.auto_title) return
+  let title = prompt.split(/\s+/u).filter(Boolean).slice(0, 7).join(' ')
+  if (!title) return
+  if ([...title].length > 54) title = `${[...title].slice(0, 53).join('')}…`
+  session.auto_title = title
 }
 
 function activeTurn(session: AgentSession) {

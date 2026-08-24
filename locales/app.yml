@@ -57,8 +57,6 @@ window.restore:
 
 updater.update:
   en: Update
-updater.checking:
-  en: Checking for updates…
 updater.updating:
   en: Updating…
 updater.up_to_date:
@@ -82,6 +80,8 @@ command_palette.open_project:
   en: Open project…
 command_palette.choose_model:
   en: Choose model…
+command_palette.collapse_sidebar_groups:
+  en: Collapse all sidebar groups
 command_palette.show_sidebar:
   en: Show sidebar
 command_palette.hide_sidebar:
@@ -123,7 +123,7 @@ settings.computer_use:
 settings.general_keywords:
   en: general local projects conversations privacy analytics telemetry anonymous sharing updates automatic sparkle version
 settings.appearance_keywords:
-  en: appearance theme system light dark language english chinese simplified
+  en: appearance theme system light dark language english chinese simplified font size text editor
 settings.providers_keywords:
   en: providers agents models cli version install detect claude codex cursor opencode amp grok pi
 settings.skills:
@@ -143,7 +143,7 @@ settings.search:
 daemon.expose_title:
   en: Expose managed daemon
 daemon.expose_description:
-  en: Listen beyond this Mac so another Waku client can connect. Changing this restarts only the daemon.
+  en: Listen beyond this machine so another Waku client can connect. Changing this restarts only the daemon.
 daemon.status_local:
   en: Local only
 daemon.status_exposed:
@@ -173,7 +173,7 @@ daemon.restarting:
 daemon.credentials_title:
   en: Connection details
 daemon.credentials_description:
-  en: Enter these in Waku Web. The URL uses this Mac’s local network hostname.
+  en: Enter these in Waku Web. The URL uses this machine’s local network hostname.
 daemon.websocket_url:
   en: WebSocket URL
 daemon.token:
@@ -185,7 +185,7 @@ daemon.hide_token:
 daemon.regenerate_token:
   en: Regenerate
 daemon.security_warning:
-  en: The token grants full access to tasks, files, Git, attachments, and coding agents on this Mac. Use WSS through a trusted TLS proxy outside a private network.
+  en: The token grants full access to tasks, files, Git, attachments, and coding agents on this machine. Use WSS through a trusted TLS proxy outside a private network.
 daemon.external_title:
   en: External daemon
 daemon.external_description:
@@ -274,6 +274,14 @@ settings.theme:
   en: Theme
 settings.theme_description:
   en: Choose between system, light, or dark themes
+settings.ui_font_size:
+  en: UI font size
+settings.ui_font_size_description:
+  en: Text size across the interface and messages
+settings.code_font_size:
+  en: Code font size
+settings.code_font_size_description:
+  en: Text size in the file editor, diffs, code blocks, and tool output
 settings.theme_system:
   en: System
 settings.theme_light:
@@ -318,7 +326,7 @@ common.creating:
 settings.local_by_default:
   en: Local by default
 settings.local_by_default_description:
-  en: Projects, conversations, and settings are stored on this Mac
+  en: Projects, conversations, and settings are stored on this computer
 settings.local_by_default_web_description:
   en: Projects, conversations, and attachments stay on the connected daemon host. Waku Web preferences stay in this browser.
 settings.automatic_updates:
@@ -333,7 +341,7 @@ settings.share_anonymous_usage_data_description:
 providers.coding_agents:
   en: Coding agents
 providers.description:
-  en: Waku drives agent CLIs installed on this Mac. Install or sign in with each agent's own CLI, then refresh
+  en: Waku drives agent CLIs installed on this computer. Install or sign in with each agent's own CLI, then refresh
 providers.web_description:
   en: Waku drives agent CLIs installed on the daemon host. Install or sign in with each agent's own CLI, then refresh
 providers.check_failed:
@@ -420,6 +428,22 @@ sidebar.today:
   en: Today
 sidebar.search:
   en: Search
+sidebar.options:
+  en: Sidebar options
+sidebar.grouping:
+  en: Grouping
+sidebar.grouping_project:
+  en: Project
+sidebar.grouping_updated:
+  en: Updated
+sidebar.ordering:
+  en: Ordering
+sidebar.ordering_newest:
+  en: Newest first
+sidebar.ordering_oldest:
+  en: Oldest first
+sidebar.show_more:
+  en: Show more
 sidebar.yesterday:
   en: Yesterday
 sidebar.this_week:
@@ -481,7 +505,7 @@ project.your_project:
 onboarding.open_project_to_begin:
   en: Open a project to begin
 onboarding.description:
-  en: Waku runs coding agents in folders you choose. Your code, sessions, and history stay on this Mac
+  en: Waku runs coding agents in folders you choose. Your code, sessions, and history stay on this computer
 onboarding.web_description:
   en: Choose a path on the daemon host, or start without a project.
 onboarding.open_project_folder:
@@ -584,6 +608,8 @@ activity.output:
   en: Output
 activity.image_output:
   en: Image output
+activity.open_file:
+  en: Open file
 activity.search_for:
   en: Search for %{query}
 activity.searched_web:
@@ -781,6 +807,8 @@ mode.full_access_description:
   en: Allow commands and edits without prompts
 mode.switch_to:
   en: Switch to %{mode}
+mode.plan_not_supported:
+  en: This agent does not support Plan
 
 agent_preset.standard:
   en: Standard mode
@@ -863,6 +891,9 @@ common.close:
 common.default:
   en: Default
 
+composer.no_providers:
+  en: Install or switch on a provider to send
+
 models.none_found:
   en: No models found
 models.favorite_hint:
@@ -871,6 +902,14 @@ models.loading:
   en: Loading models…
 models.none_reported:
   en: No models reported by this provider
+models.no_providers:
+  en: No providers
+models.no_providers_title:
+  en: No providers available
+models.no_providers_description:
+  en: Install an agent CLI, or switch one back on in Provider settings.
+models.open_provider_settings:
+  en: Open Provider Settings
 models.choose:
   en: Choose model
 models.favorites:
@@ -1017,31 +1056,63 @@ skills.enable_named:
 skills.disable_named:
   en: Disable %{name}
 
-commands.init_description:
-  en: Create or update %{instructions_file} for this project
-commands.review_description:
-  en: Review the pending changes on this branch
-commands.commit_description:
-  en: Stage and commit the current changes
 commands.fast_description:
   en: Toggle fast mode
 commands.fast_enabled:
   en: Fast mode enabled
 commands.fast_disabled:
   en: Fast mode disabled
-commands.claude_compact:
-  en: Free up context by summarizing the conversation
-commands.claude_context:
-  en: Show what is occupying the context window
-commands.claude_cost:
-  en: Show token usage and cost for this session
-commands.claude_init:
-  en: Analyze the project and write CLAUDE.md
-commands.claude_review:
-  en: Review a pull request
-commands.claude_security_review:
-  en: Security review of the pending changes
+commands.goal_description:
+  en: Set a goal this task keeps pursuing
 
+goal.title:
+  en: Goal
+goal.objective_placeholder:
+  en: What should this task keep working toward?
+goal.set:
+  en: Set goal
+goal.save:
+  en: Save goal
+goal.replace:
+  en: Replace goal
+goal.replace_notice:
+  en: Saving replaces the current goal and restarts its progress.
+goal.pause:
+  en: Pause goal
+goal.resume:
+  en: Resume goal
+goal.clear:
+  en: Clear goal
+goal.status_active:
+  en: Active
+goal.status_paused:
+  en: Paused
+goal.status_stalled:
+  en: Stalled
+goal.status_usage_limited:
+  en: Usage limited
+goal.status_budget_limited:
+  en: Budget exhausted
+goal.status_complete:
+  en: Complete
+goal.chip_active:
+  en: Pursuing goal
+goal.chip_paused:
+  en: Goal paused
+goal.chip_stalled:
+  en: Goal stalled
+goal.chip_usage_limited:
+  en: Goal hit usage limits
+goal.chip_budget_limited:
+  en: Goal unmet
+goal.chip_complete:
+  en: Goal achieved
+goal.set_notice:
+  en: "Set goal: %{objective}"
+goal.usage_tokens:
+  en: "%{used} / %{budget} tokens"
+goal.usage_tokens_unbudgeted:
+  en: "%{used} tokens"
 composer.edit_in_composer:
   en: Edit in composer
 composer.steer:
@@ -1084,6 +1155,8 @@ composer.starting_agent:
   en: Starting agent…
 composer.suggestions:
   en: Composer suggestions
+composer.loading_suggestions:
+  en: Loading suggestions…
 composer.remove_attachment:
   en: Remove %{name}
 
@@ -1184,8 +1257,10 @@ errors.claude_fork_checkpoint_missing:
   en: Claude omitted the fork checkpoint
 errors.claude_turn_checkpoint_unavailable:
   en: "Claude's native checkpoint for that turn is unavailable: %{error}"
-errors.pi_session_file_unavailable:
-  en: Pi's native session file is unavailable
+errors.provider_session_file_unavailable:
+  en: "%{provider}'s native session file is unavailable"
+errors.provider_turn_branching_unsupported:
+  en: "%{provider} cannot rewind or branch a conversation at a turn"
 errors.fork_task:
   en: "Could not fork the task: %{error}"
 errors.create_rewind_snapshot:
@@ -1282,6 +1357,8 @@ errors.register_computer_use_skill:
   en: Failed to register Waku Computer Use skill with Codex
 errors.codex_thread_open_incomplete:
   en: Codex did not finish opening its thread
+errors.codex_goals_unsupported:
+  en: This Codex version does not support thread goals
 errors.provider_receive_prompt:
   en: "%{provider} could not receive the prompt"
 errors.provider_start_turn:
@@ -1296,8 +1373,8 @@ errors.provider_rejected_prompt:
   en: "%{provider} rejected the prompt before it ran"
 errors.provider_complete_turn:
   en: "%{provider} could not complete this turn"
-errors.pi_reported_error:
-  en: Pi reported an error
+errors.provider_reported_error:
+  en: "%{provider} reported an error"
 
 session.response_unavailable:
   en: That response is no longer available
@@ -1368,6 +1445,11 @@ right_panel.hide:
   en: Hide right panel
 right_panel.close_tab:
   en: Close %{title}
+
+open_in.open:
+  en: Open project in %{app}
+open_in.choose:
+  en: Open project in…
 
 environment.title:
   en: Environment
@@ -1506,6 +1588,10 @@ files.could_not_save_read_only:
   en: "Could not save %{path}: file is not editable"
 files.could_not_save:
   en: "Could not save %{path}: %{error}"
+files.preview_markdown:
+  en: Preview markdown
+files.edit_markdown_source:
+  en: Edit source
 files.resize_tree:
   en: Resize file tree
 files.refresh:
@@ -1644,6 +1730,14 @@ diff.file_count_one:
   en: 1 file
 diff.file_count:
   en: "%{count} files"
+diff.status_added:
+  en: Added
+diff.status_deleted:
+  en: Deleted
+diff.rows_hidden_one:
+  en: 1 more line · open Review to read the whole change
+diff.rows_hidden:
+  en: "%{count} more lines · open Review to read the whole change"
 
 terminal.transport_failed:
   en: Terminal transport failed
@@ -1668,8 +1762,8 @@ browser.start_hint:
   en: Enter a URL or search above — %{shortcut} focuses the address bar
 browser.unavailable:
   en: Browser unavailable
-browser.requires_macos:
-  en: The browser surface requires macOS
+browser.unavailable_on_platform:
+  en: The browser surface is not available on this platform yet
 
 find.bad_pattern:
   en: Bad pattern
